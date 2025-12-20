@@ -3,11 +3,9 @@ import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import ScanScreen from "../screens/ScanScreen";
 import ProductScreen from "../screens/ProductScreen";
 
-export type ProductTabKey = "Health" | "Additives" | "Allergens" | "Diet" | "Eco";
-
 export type ScanStackParamList = {
   Scan: undefined;
-  Product: { barcode: string; initialTab?: ProductTabKey };
+  Product: { barcode: string };
 };
 
 const Stack = createNativeStackNavigator<ScanStackParamList>();
@@ -19,7 +17,6 @@ export default function ScanStack() {
         headerStyle: { backgroundColor: "#0b0f14" },
         headerTintColor: "white",
         contentStyle: { backgroundColor: "#0b0f14" },
-        headerShadowVisible: false,
       }}
     >
       <Stack.Screen name="Scan" component={ScanScreen} options={{ title: "Scan" }} />

@@ -1,479 +1,531 @@
-import React, { useMemo, useState } from "react";
-import {
-  Alert,
-  Modal,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  View,
-} from "react-native";
+import React, { useEffect, useMemo, useState } from "react";
+import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { NativeStackScreenProps } from "@react-navigation/native-stack";
 
-import { ScanStackParamList } from "../navigation/ScanStack";
+import { ScanStackParamList, ProductTabKey } from "../navigation/ScanStack";
+import Chip from "../components/Chip";
+import InfoSheet from "../components/InfoSheet";
+import { upsertRoutineItem } from "../store/routineStore";
 
 type Props = NativeStackScreenProps<ScanStackParamList, "Product">;
-
-type TabKey = "Health" | "Additives" | "Allergens" | "Diet" | "Eco";
+type TabKey = ProductTabKey;
 
 type Additive = {
   code: string;
   name: string;
-  risk: "Low" | "Medium" | "High";
+  level: "Low" | "Medium" | "High";
   why: string;
-  notes: string;
-  sources: { label: string; url: string }[];
 };
 
-function scoreColor(score: number) {
-  if (score >= 80) return "#22c55e";
-  if (score >= 60) return "#84cc16";
-  if (score >= 40) return "#f59e0b";
-  return "#ef4444";
+type ProductVM = {
+  barcode: string;
+  name: string;
+  brand: string;
+
+  healthScore: number; // 0-100
+  additives: Additive[];
+  allergens: { name: string; status: "Contains" | "May contain" | "Not listed" }[];
+  vegan: "Yes" | "No" | "Unknown";
+  vegetarian: "Yes" | "No" | "Unknown";
+  eco: { grade: "A" | "B" | "C" | "D" | "E"; summary: string };
+
+  sources: { label: string; url?: string }[];
+};
+
+function seededNumber(barcode: string) {
+  let x = 0;
+  for (let i = 0; i < barcode.length; i++) x = (x * 31 + barcode.charCodeAt(i)) >>> 0;
+  return x;
 }
 
-function riskColor(risk: Additive["risk"]) {
-  if (risk === "Low") return "#22c55e";
-  if (risk === "Medium") return "#f59e0b";
-  return "#ef4444";
+function buildPlaceholderProduct(barcode: string): ProductVM {
+  const seed = seededNumber(barcode);
+  const healthScore = 40 + (seed % 56); // 40..95
+  const grades: ProductVM["eco"]["grade"][] = ["A", "B", "C", "D", "E"];
+  const eco = grades[(seed >>> 3) % grades.length];
+
+  const vegan: ProductVM["vegan"] = (seed % 3) === 0 ? "Yes" : (seed % 3) === 1 ? "No" : "Unknown";
+  const vegetarian: ProductVM["vegetarian"] = (seed % 4) === 0 ? "Yes" : (seed % 4) === 1 ? "No" : "Unknown";
+
+  const additives: Additive[] = [
+    {
+      code: "E102",
+      name: "Tartrazine (placeholder)",
+      level: "High",
+      why: "Placeholder: associated with sensitivity reactions in some people. Later: replace with evidence-based text + citations.",
+    },
+    {
+      code: "E211",
+      name: "Sodium benzoate (placeholder)",
+      level: "Medium",
+      why: "Placeholder: preservative; interactions depend on dose/context. Later: connect to your backend + sources.",
+    },
+    {
+      code: "E330",
+      name: "Citric acid (placeholder)",
+      level: "Low",
+      why: "Placeholder: common acidifier; typically low concern for most users.",
+    },
+  ];
+
+  const allergens = [
+    { name: "Milk", status: "May contain" as const },
+    { name: "Soy", status: "Contains" as const },
+    { name: "Nuts", status: "Not listed" as const },
+    { name: "Gluten", status: "Not listed" as const },
+  ];
+
+  return {
+    barcode,
+    name: `Product (placeholder) • ${barcode.slice(-4)}`,
+    brand: "Brand (placeholder)",
+    healthScore,
+    additives,
+    allergens,
+    vegan,
+    vegetarian,
+    eco: {
+      grade: eco,
+      summary:
+        "Placeholder: Eco score will summarize packaging, sourcing, and footprint once backend is connected.",
+    },
+    sources: [
+      { label: "Example source (placeholder)", url: "https://example.com" },
+      { label: "Another placeholder reference", url: "https://example.com" },
+    ],
+  };
 }
 
-function Chip({
-  label,
-  active,
-  onPress,
-}: {
-  label: string;
-  active?: boolean;
-  onPress?: () => void;
-}) {
-  return (
-    <Pressable
-      onPress={onPress}
-      style={[styles.chip, active ? styles.chipActive : styles.chipIdle]}
-      accessibilityRole="button"
-      accessibilityState={{ selected: !!active }}
-    >
-      <Text style={[styles.chipText, active ? styles.chipTextActive : styles.chipTextIdle]}>
-        {label}
-      </Text>
-    </Pressable>
-  );
+function toneForAdditive(level: Additive["level"]) {
+  if (level === "High") return "bad";
+  if (level === "Medium") return "warn";
+  return "good";
+}
+
+function toneForEco(grade: string) {
+  if (grade === "A" || grade === "B") return "good";
+  if (grade === "C") return "warn";
+  return "bad";
 }
 
 export default function ProductScreen({ route, navigation }: Props) {
-  const barcode = route.params?.barcode ?? "";
+  const { barcode } = route.params;
+  const initialTab = (route.params?.initialTab as TabKey | undefined) ?? "Health";
 
-  // Placeholder product (swap later with backend fetch)
-  const product = useMemo(() => {
-    const additives: Additive[] = [
-      {
-        code: "E150d",
-        name: "Caramel colour (sulphite ammonia)",
-        risk: "Medium",
-        why: "Flagged in some contexts due to potential byproducts depending on manufacturing process.",
-        notes:
-          "This is a placeholder text. Later you’ll replace this with your curated explanation and evidence.",
-        sources: [
-          { label: "Source placeholder 1", url: "https://example.com/source-1" },
-          { label: "Source placeholder 2", url: "https://example.com/source-2" },
-        ],
-      },
-      {
-        code: "E102",
-        name: "Tartrazine",
-        risk: "High",
-        why: "Flagged for sensitive individuals; some evidence links it to intolerance-type reactions.",
-        notes:
-          "Placeholder. You’ll connect to your additive knowledge base and show confidence level + reviewed date.",
-        sources: [
-          { label: "Source placeholder A", url: "https://example.com/source-a" },
-          { label: "Source placeholder B", url: "https://example.com/source-b" },
-        ],
-      },
-    ];
+  const [tab, setTab] = useState<TabKey>(initialTab);
+  const [sheet, setSheet] = useState<null | { title: string; body: string }>(null);
 
-    return {
-      name: "Scanned product (placeholder)",
-      brand: "Brand (placeholder)",
-      barcode,
-      score: 62,
-      ecoScore: "B" as "A" | "B" | "C" | "D" | "E",
-      vegan: false,
-      vegetarian: true,
-      allergens: ["Milk", "Soy"],
-      additives,
-    };
-  }, [barcode]);
+  const product = useMemo(() => buildPlaceholderProduct(barcode), [barcode]);
 
-  const [tab, setTab] = useState<TabKey>("Health");
-  const [openAdditive, setOpenAdditive] = useState<Additive | null>(null);
+  useEffect(() => {
+    navigation.setOptions({ title: product.name });
+  }, [navigation, product.name]);
+
+  useEffect(() => {
+    // when coming from scan with a specific mode
+    setTab(initialTab);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [barcode, route.params?.initialTab]);
+
+  const allergensCount = product.allergens.filter((a) => a.status !== "Not listed").length;
+  const additiveRisk =
+    product.additives.some((a) => a.level === "High")
+      ? "High"
+      : product.additives.some((a) => a.level === "Medium")
+      ? "Medium"
+      : "Low";
 
   const addToRoutine = () => {
-    const g: any = globalThis as any;
-    if (!g.__routineItems) g.__routineItems = [];
-    const store = g.__routineItems as any[];
-    const exists = store.some((x) => x?.barcode && x.barcode === barcode);
-    if (!exists) {
-      store.push({ id: String(Date.now()), name: product.name, barcode });
-      g.__routineItems = store;
-    }
-    Alert.alert(
-      exists ? "Already in Routine" : "Added to Routine",
-      exists ? "This product is already in your Routine." : "Added. Want to view your Routine now?",
-      [
-        {
-          text: "View",
-          onPress: () => {
-            const parent: any = (navigation as any).getParent?.();
-            parent?.navigate?.("Routine");
-          },
-        },
-        { text: "OK", style: "cancel" },
-      ]
-    );
+    upsertRoutineItem({
+      id: product.barcode,
+      barcode: product.barcode,
+      name: product.name,
+      brand: product.brand,
+      addedAtISO: new Date().toISOString(),
+      badges: {
+        eco: product.eco.grade,
+        vegan: product.vegan,
+        vegetarian: product.vegetarian,
+        allergensCount,
+        additivesRisk: additiveRisk,
+      },
+    });
+    Alert.alert("Added to Routine", "This item is now in your daily routine list (placeholder storage).");
   };
 
-
-  const score = product.score;
-  const scoreBg = scoreColor(score);
-
-  const dietLabel = product.vegan ? "Vegan" : product.vegetarian ? "Vegetarian" : "Not vegetarian";
-  const dietBadgeBg = product.vegan ? "#22c55e" : product.vegetarian ? "#84cc16" : "#ef4444";
-
   return (
-    <SafeAreaView style={styles.container}>
-      <ScrollView contentContainerStyle={styles.scroll}>
-        {/* Header */}
-        <View style={styles.headerRow}>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.title}>{product.name}</Text>
-            <Text style={styles.subTitle}>
-              {product.brand} • {product.barcode || "—"}
-            </Text>
-          </View>
+    <SafeAreaView style={styles.container} edges={["bottom"]}>
+      <ScrollView
+        contentContainerStyle={{ paddingBottom: 22 }}
+        stickyHeaderIndices={[0]}
+        showsVerticalScrollIndicator={false}
+      >
+        {/* Sticky top section */}
+        <View style={styles.sticky}>
+          <View style={styles.headerTop}>
+            <Pressable style={styles.backBtn} onPress={() => navigation.goBack()}>
+              <Ionicons name="chevron-back" size={18} color="white" />
+            </Pressable>
 
-          <View style={[styles.scorePill, { backgroundColor: scoreBg }]}>
-            <Text style={styles.scoreNumber}>{score}</Text>
-            <Text style={styles.scoreOutOf}>/100</Text>
-          </View>
-        </View>
-
-        {/* Quick badges */}
-        <View style={styles.badgeRow}>
-          <View style={[styles.badge, { backgroundColor: "#111827" }]}>
-            <Ionicons name="leaf-outline" size={16} color="#d1d5db" />
-            <Text style={styles.badgeText}>Eco {product.ecoScore}</Text>
-          </View>
-
-          <View style={[styles.badge, { backgroundColor: dietBadgeBg }]}>
-            <Ionicons name="nutrition-outline" size={16} color="#0b0f14" />
-            <Text style={[styles.badgeText, { color: "#0b0f14" }]}>{dietLabel}</Text>
-          </View>
-
-          <View style={[styles.badge, { backgroundColor: product.allergens.length ? "#ef4444" : "#22c55e" }]}>
-            <Ionicons name="alert-circle-outline" size={16} color="#0b0f14" />
-            <Text style={[styles.badgeText, { color: "#0b0f14" }]}>
-              {product.allergens.length ? "Allergens" : "No allergens"}
-            </Text>
-          </View>
-        </View>
-
-        {/* Actions */}
-        <View style={styles.actionRow}>
-          <Pressable
-            style={[styles.actionBtn, styles.actionPrimary]}
-            onPress={addToRoutine}
-          >
-            <Ionicons name="add-circle-outline" size={18} color="#0b0f14" />
-            <Text style={[styles.actionText, { color: "#0b0f14" }]}>Add to Routine</Text>
-          </Pressable>
-
-          <Pressable
-            style={[styles.actionBtn, styles.actionSecondary]}
-            onPress={() => Alert.alert("Placeholder", "This will save to Favorites later.")}
-          >
-            <Ionicons name="bookmark-outline" size={18} color="#e5e7eb" />
-            <Text style={[styles.actionText, { color: "#e5e7eb" }]}>Save</Text>
-          </Pressable>
-        </View>
-
-        {/* Tabs */}
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tabsRow}>
-          {(["Health", "Additives", "Allergens", "Diet", "Eco"] as TabKey[]).map((k) => (
-            <Chip key={k} label={k} active={tab === k} onPress={() => setTab(k)} />
-          ))}
-        </ScrollView>
-
-        {/* Content */}
-        <View style={styles.card}>
-          {tab === "Health" && (
-            <View>
-              <Text style={styles.cardTitle}>Health overview</Text>
-              <Text style={styles.cardText}>
-                Placeholder: show nutrition / processing / additive summary here.
+            <View style={{ flex: 1 }}>
+              <Text style={styles.title} numberOfLines={1}>
+                {product.name}
               </Text>
-              <Text style={styles.cardText}>
-                Later you’ll plug your backend scoring explanation (and confidence) into this section.
+              <Text style={styles.subtitle} numberOfLines={1}>
+                {product.brand} • {product.barcode}
               </Text>
             </View>
-          )}
 
-          {tab === "Additives" && (
-            <View>
-              <Text style={styles.cardTitle}>Additives</Text>
+            <View style={styles.scorePill}>
+              <Text style={styles.scoreLabel}>Score</Text>
+              <Text style={styles.scoreValue}>{product.healthScore}</Text>
+            </View>
+          </View>
 
-              {product.additives.map((a) => (
-                <View key={a.code} style={styles.rowItem}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.rowTitle}>
-                      {a.code} • {a.name}
-                    </Text>
-                    <Text style={styles.rowSub}>{a.why}</Text>
+          <View style={styles.chipsRow}>
+            <Chip label={`Eco ${product.eco.grade}`} tone={toneForEco(product.eco.grade) as any} />
+            <Chip label={`Vegan: ${product.vegan}`} tone={product.vegan === "Yes" ? "good" : product.vegan === "No" ? "bad" : "neutral"} />
+            <Chip
+              label={`Veg: ${product.vegetarian}`}
+              tone={product.vegetarian === "Yes" ? "good" : product.vegetarian === "No" ? "bad" : "neutral"}
+            />
+            <Chip label={`Allergens: ${allergensCount}`} tone={allergensCount ? "warn" : "good"} />
+            <Chip
+              label={`Additives: ${product.additives.length}`}
+              tone={additiveRisk === "High" ? "bad" : additiveRisk === "Medium" ? "warn" : "good"}
+            />
+          </View>
+
+          <Pressable style={styles.primaryBtn} onPress={addToRoutine}>
+            <Ionicons name="add-circle-outline" size={18} color="white" />
+            <Text style={styles.primaryText}>Add to my Routine</Text>
+          </Pressable>
+
+          {/* Tabs */}
+          <View style={styles.tabs}>
+            {(["Health", "Additives", "Allergens", "Diet", "Eco"] as TabKey[]).map((k) => {
+              const active = tab === k;
+              return (
+                <Pressable key={k} onPress={() => setTab(k)} style={[styles.tab, active ? styles.tabActive : null]}>
+                  <Text style={[styles.tabText, active ? styles.tabTextActive : null]}>{k}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        </View>
+
+        {/* Content */}
+        <View style={{ paddingHorizontal: 16, paddingTop: 14, gap: 12 }}>
+          {tab === "Health" ? (
+            <>
+              <Card title="Health score">
+                <Text style={styles.p}>
+                  Placeholder score based on scanned barcode. Later: compute from nutrition + additives + profile.
+                </Text>
+                <Row label="Overall" value={`${product.healthScore}/100`} />
+                <Row label="Additives risk" value={additiveRisk} />
+                <Row label="Allergens flagged" value={`${allergensCount}`} />
+
+                <Pressable
+                  style={styles.moreBtn}
+                  onPress={() =>
+                    setSheet({
+                      title: "How the Health score works (placeholder)",
+                      body:
+                        "This will explain your scoring logic clearly:\n\n• Ingredient quality\n• Additives severity\n• Profile-based risks (allergies)\n\nLater you’ll show citations and a breakdown with confidence.",
+                    })
+                  }
+                >
+                  <Text style={styles.moreText}>More</Text>
+                  <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.8)" />
+                </Pressable>
+              </Card>
+
+              <Card title="What to improve">
+                <Text style={styles.p}>
+                  Placeholder suggestions: choose fewer additives, prefer simple ingredient lists, verify allergen
+                  statements.
+                </Text>
+              </Card>
+            </>
+          ) : null}
+
+          {tab === "Additives" ? (
+            <>
+              <Card title="Additives found (placeholder)">
+                {product.additives.map((a) => (
+                  <View key={a.code} style={styles.listRow}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.rowTitle}>
+                        {a.code} • {a.name}
+                      </Text>
+                      <Text style={styles.rowSub}>Risk: {a.level}</Text>
+                    </View>
+
+                    <Pressable
+                      style={[styles.badge, a.level === "High" ? styles.badgeBad : a.level === "Medium" ? styles.badgeWarn : styles.badgeGood]}
+                      onPress={() =>
+                        setSheet({
+                          title: `${a.code} • ${a.name}`,
+                          body: a.why + "\n\nLater: this sheet will show evidence, confidence, and references.",
+                        })
+                      }
+                    >
+                      <Text style={styles.badgeText}>More</Text>
+                    </Pressable>
                   </View>
+                ))}
+              </Card>
 
-                  <View style={[styles.riskPill, { backgroundColor: riskColor(a.risk) }]}>
-                    <Text style={styles.riskText}>{a.risk}</Text>
+              <Card title="Why additives matter">
+                <Text style={styles.p}>
+                  Good UX principle: don’t scare users—explain severity + context + alternatives, and always show sources.
+                </Text>
+              </Card>
+            </>
+          ) : null}
+
+          {tab === "Allergens" ? (
+            <Card title="Allergens (placeholder)">
+              {product.allergens.map((a) => (
+                <View key={a.name} style={styles.listRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.rowTitle}>{a.name}</Text>
+                    <Text style={styles.rowSub}>{a.status}</Text>
                   </View>
 
                   <Pressable
-                    style={styles.moreBtn}
-                    onPress={() => setOpenAdditive(a)}
-                    accessibilityRole="button"
+                    style={styles.smallMore}
+                    onPress={() =>
+                      setSheet({
+                        title: `${a.name} • Explanation (placeholder)`,
+                        body:
+                          "Later: show why this allergen is flagged, how you detected it (label text / may contain), and the source.\n\nAlso include user preference: 'avoid completely' vs 'warn'.",
+                      })
+                    }
                   >
-                    <Text style={styles.moreText}>More</Text>
+                    <Text style={styles.smallMoreText}>More</Text>
                   </Pressable>
                 </View>
               ))}
+            </Card>
+          ) : null}
 
-              <Text style={styles.footnote}>
-                Tip: later this list will come from your database + show “reviewed date” and confidence.
-              </Text>
-            </View>
-          )}
-
-          {tab === "Allergens" && (
-            <View>
-              <Text style={styles.cardTitle}>Allergens</Text>
-              {product.allergens.length ? (
-                product.allergens.map((al) => (
-                  <View key={al} style={styles.bulletRow}>
-                    <View style={styles.dot} />
-                    <Text style={styles.cardText}>Contains: {al}</Text>
-                  </View>
-                ))
-              ) : (
-                <Text style={styles.cardText}>No allergens detected (placeholder).</Text>
-              )}
-              <Text style={styles.footnote}>
-                Later: show “Contains / May contain / Free from” and personalize using user profile.
-              </Text>
-            </View>
-          )}
-
-          {tab === "Diet" && (
-            <View>
-              <Text style={styles.cardTitle}>Diet</Text>
-              <Text style={styles.cardText}>
-                Vegan: {product.vegan ? "Yes" : "No"}
-              </Text>
-              <Text style={styles.cardText}>
-                Vegetarian: {product.vegetarian ? "Yes" : "No"}
-              </Text>
-              <Text style={styles.footnote}>
-                Later: show “Why/Why not” (e.g., ingredient triggers) + user preference filters.
-              </Text>
-            </View>
-          )}
-
-          {tab === "Eco" && (
-            <View>
-              <Text style={styles.cardTitle}>Environmental impact</Text>
-              <Text style={styles.cardText}>Eco score: {product.ecoScore} (placeholder)</Text>
-              <Text style={styles.cardText}>
-                Later: show drivers (packaging, sourcing, transport, etc.) and compare alternatives.
-              </Text>
-            </View>
-          )}
-        </View>
-
-        {/* Back to scan */}
-        <Pressable
-          style={styles.backLink}
-          onPress={() => navigation.popToTop()}
-          accessibilityRole="button"
-        >
-          <Ionicons name="arrow-back-outline" size={18} color="#93c5fd" />
-          <Text style={styles.backLinkText}>Back to scan</Text>
-        </Pressable>
-      </ScrollView>
-
-      {/* Additive modal (progressive disclosure + sources) */}
-      <Modal
-        visible={!!openAdditive}
-        transparent
-        animationType="slide"
-        onRequestClose={() => setOpenAdditive(null)}
-      >
-        <View style={styles.modalBackdrop}>
-          <View style={styles.modalSheet}>
-            <View style={styles.modalHeader}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.modalTitle}>
-                  {openAdditive?.code} • {openAdditive?.name}
-                </Text>
-                <View style={{ marginTop: 8, alignSelf: "flex-start" }}>
-                  <View
-                    style={[
-                      styles.riskPill,
-                      { backgroundColor: openAdditive ? riskColor(openAdditive.risk) : "#374151" },
-                    ]}
-                  >
-                    <Text style={styles.riskText}>{openAdditive?.risk}</Text>
-                  </View>
-                </View>
-              </View>
-
-              <Pressable onPress={() => setOpenAdditive(null)} style={styles.closeBtn}>
-                <Ionicons name="close" size={22} color="#e5e7eb" />
+          {tab === "Diet" ? (
+            <Card title="Diet compatibility (placeholder)">
+              <Row label="Vegan" value={product.vegan} />
+              <Row label="Vegetarian" value={product.vegetarian} />
+              <Pressable
+                style={styles.moreBtn}
+                onPress={() =>
+                  setSheet({
+                    title: "How vegan/vegetarian is determined (placeholder)",
+                    body:
+                      "Later: use ingredients + additives + traces.\n\nAlso show uncertain cases as 'Unknown' with an explanation instead of guessing.",
+                  })
+                }
+              >
+                <Text style={styles.moreText}>More</Text>
+                <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.8)" />
               </Pressable>
-            </View>
+            </Card>
+          ) : null}
 
-            <ScrollView contentContainerStyle={{ paddingBottom: 18 }}>
-              <Text style={styles.modalSectionTitle}>Why it’s flagged</Text>
-              <Text style={styles.modalText}>{openAdditive?.why}</Text>
+          {tab === "Eco" ? (
+            <Card title="Environmental impact (placeholder)">
+              <Row label="Eco score" value={product.eco.grade} />
+              <Text style={styles.p}>{product.eco.summary}</Text>
+              <Pressable
+                style={styles.moreBtn}
+                onPress={() =>
+                  setSheet({
+                    title: `Eco score ${product.eco.grade} • Details (placeholder)`,
+                    body:
+                      "Later: show breakdown:\n\n• Packaging\n• Origin\n• Farming method\n• Transport\n\nAnd show citations per component.",
+                  })
+                }
+              >
+                <Text style={styles.moreText}>More</Text>
+                <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.8)" />
+              </Pressable>
+            </Card>
+          ) : null}
 
-              <Text style={styles.modalSectionTitle}>Notes</Text>
-              <Text style={styles.modalText}>{openAdditive?.notes}</Text>
-
-              <Text style={styles.modalSectionTitle}>Sources</Text>
-              {openAdditive?.sources?.map((s) => (
-                <View key={s.url} style={styles.sourceRow}>
-                  <Ionicons name="link-outline" size={16} color="#9ca3af" />
-                  <Text style={styles.sourceText}>{s.label}</Text>
-                </View>
-              ))}
-
-              <Text style={styles.modalFoot}>
-                Placeholder: later you’ll show real sources + reviewed date + confidence.
-              </Text>
-            </ScrollView>
+          <View style={styles.footer}>
+            <Text style={styles.footerText}>
+              Disclaimer: placeholder UI. Not medical advice. Always check labels and consult professionals for
+              health decisions.
+            </Text>
           </View>
         </View>
-      </Modal>
+      </ScrollView>
+
+      <InfoSheet
+        visible={!!sheet}
+        title={sheet?.title ?? ""}
+        body={sheet?.body ?? ""}
+        sources={product.sources}
+        onClose={() => setSheet(null)}
+      />
     </SafeAreaView>
+  );
+}
+
+function Card({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <View style={styles.card}>
+      <Text style={styles.cardTitle}>{title}</Text>
+      {children}
+    </View>
+  );
+}
+
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.kvRow}>
+      <Text style={styles.k}>{label}</Text>
+      <Text style={styles.v}>{value}</Text>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#0b0f14" },
-  scroll: { padding: 16, paddingBottom: 28 },
 
-  headerRow: { flexDirection: "row", alignItems: "center", gap: 12 },
-  title: { color: "white", fontSize: 20, fontWeight: "900" },
-  subTitle: { color: "#9ca3af", marginTop: 4 },
+  sticky: {
+    backgroundColor: "#0b0f14",
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(255,255,255,0.08)",
+  },
+  headerTop: { flexDirection: "row", alignItems: "center", gap: 10 },
+  backBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 999,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+  },
+  title: { color: "white", fontSize: 16, fontWeight: "900" },
+  subtitle: { color: "rgba(255,255,255,0.65)", fontSize: 12, fontWeight: "800", marginTop: 2 },
 
   scorePill: {
-    minWidth: 86,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 14,
-    flexDirection: "row",
-    alignItems: "flex-end",
-    justifyContent: "center",
-    gap: 2,
-  },
-  scoreNumber: { color: "#0b0f14", fontSize: 22, fontWeight: "900" },
-  scoreOutOf: { color: "#0b0f14", fontSize: 12, fontWeight: "900", marginBottom: 3 },
-
-  badgeRow: { flexDirection: "row", gap: 10, flexWrap: "wrap", marginTop: 12 },
-  badge: {
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderRadius: 999,
-    flexDirection: "row",
+    width: 66,
+    height: 46,
+    borderRadius: 16,
+    backgroundColor: "rgba(147,197,253,0.12)",
+    borderWidth: 1,
+    borderColor: "rgba(147,197,253,0.22)",
     alignItems: "center",
-    gap: 6,
+    justifyContent: "center",
   },
-  badgeText: { color: "#e5e7eb", fontWeight: "800" },
+  scoreLabel: { color: "rgba(255,255,255,0.70)", fontSize: 10, fontWeight: "900" },
+  scoreValue: { color: "white", fontSize: 18, fontWeight: "900", marginTop: 2 },
 
-  actionRow: { flexDirection: "row", gap: 10, marginTop: 14 },
-  actionBtn: {
-    flex: 1,
-    borderRadius: 14,
-    paddingVertical: 12,
-    paddingHorizontal: 12,
+  chipsRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 10 },
+
+  primaryBtn: {
+    marginTop: 12,
     flexDirection: "row",
     gap: 8,
     alignItems: "center",
     justifyContent: "center",
+    paddingVertical: 12,
+    borderRadius: 18,
+    backgroundColor: "rgba(56,189,248,0.16)",
+    borderWidth: 1,
+    borderColor: "rgba(56,189,248,0.28)",
   },
-  actionPrimary: { backgroundColor: "#93c5fd" },
-  actionSecondary: { backgroundColor: "#111827", borderWidth: 1, borderColor: "#1f2937" },
-  actionText: { fontWeight: "900" },
+  primaryText: { color: "white", fontWeight: "900" },
 
-  tabsRow: { paddingVertical: 14, gap: 8 },
-  chip: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 999, borderWidth: 1 },
-  chipActive: { backgroundColor: "#93c5fd", borderColor: "#93c5fd" },
-  chipIdle: { backgroundColor: "#0b0f14", borderColor: "#1f2937" },
-  chipText: { fontSize: 13, fontWeight: "900" },
-  chipTextActive: { color: "#0b0f14" },
-  chipTextIdle: { color: "#e5e7eb" },
+  tabs: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 12,
+  },
+  tab: {
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+    backgroundColor: "rgba(255,255,255,0.04)",
+  },
+  tabActive: {
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderColor: "rgba(255,255,255,0.16)",
+  },
+  tabText: { color: "rgba(255,255,255,0.72)", fontWeight: "900", fontSize: 12 },
+  tabTextActive: { color: "white" },
 
   card: {
-    backgroundColor: "#111827",
-    borderWidth: 1,
-    borderColor: "#1f2937",
     borderRadius: 18,
     padding: 14,
+    backgroundColor: "rgba(255,255,255,0.04)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
   },
-  cardTitle: { color: "white", fontSize: 16, fontWeight: "900", marginBottom: 10 },
-  cardText: { color: "#e5e7eb", lineHeight: 18, marginBottom: 8 },
-  footnote: { color: "#9ca3af", fontSize: 12, marginTop: 10, lineHeight: 16 },
+  cardTitle: { color: "white", fontWeight: "900", marginBottom: 10 },
+  p: { color: "rgba(255,255,255,0.82)", lineHeight: 18, fontSize: 13 },
 
-  rowItem: {
+  kvRow: { flexDirection: "row", justifyContent: "space-between", marginTop: 10 },
+  k: { color: "#9ca3af", fontWeight: "900" },
+  v: { color: "white", fontWeight: "900" },
+
+  listRow: {
     flexDirection: "row",
-    alignItems: "flex-start",
+    alignItems: "center",
     gap: 10,
     paddingVertical: 10,
     borderTopWidth: 1,
-    borderTopColor: "#1f2937",
+    borderTopColor: "rgba(255,255,255,0.08)",
   },
-  rowTitle: { color: "#e5e7eb", fontWeight: "900" },
-  rowSub: { color: "#9ca3af", marginTop: 4, lineHeight: 16, flexShrink: 1 },
+  rowTitle: { color: "white", fontWeight: "900" },
+  rowSub: { color: "rgba(255,255,255,0.65)", fontWeight: "800", marginTop: 3, fontSize: 12 },
 
-  riskPill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999, alignSelf: "flex-start" },
-  riskText: { color: "#0b0f14", fontWeight: "900", fontSize: 12 },
-
-  moreBtn: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999, borderWidth: 1, borderColor: "#334155" },
-  moreText: { color: "#93c5fd", fontWeight: "900", fontSize: 12 },
-
-  bulletRow: { flexDirection: "row", alignItems: "center", gap: 10, marginBottom: 6 },
-  dot: { width: 7, height: 7, borderRadius: 7, backgroundColor: "#93c5fd" },
-
-  backLink: { marginTop: 14, flexDirection: "row", gap: 8, alignItems: "center", alignSelf: "flex-start" },
-  backLinkText: { color: "#93c5fd", fontWeight: "900" },
-
-  modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.55)", justifyContent: "flex-end" },
-  modalSheet: {
-    backgroundColor: "#0b0f14",
-    borderTopLeftRadius: 22,
-    borderTopRightRadius: 22,
+  badge: {
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 999,
     borderWidth: 1,
-    borderColor: "#1f2937",
-    padding: 16,
-    maxHeight: "80%",
   },
-  modalHeader: { flexDirection: "row", alignItems: "flex-start", gap: 10, marginBottom: 10 },
-  modalTitle: { color: "white", fontSize: 16, fontWeight: "900" },
-  closeBtn: { padding: 6, borderRadius: 10, backgroundColor: "#111827", borderWidth: 1, borderColor: "#1f2937" },
+  badgeText: { color: "white", fontWeight: "900", fontSize: 12 },
+  badgeGood: { backgroundColor: "rgba(34,197,94,0.10)", borderColor: "rgba(34,197,94,0.22)" },
+  badgeWarn: { backgroundColor: "rgba(245,158,11,0.12)", borderColor: "rgba(245,158,11,0.24)" },
+  badgeBad: { backgroundColor: "rgba(239,68,68,0.12)", borderColor: "rgba(239,68,68,0.24)" },
 
-  modalSectionTitle: { color: "white", fontWeight: "900", marginTop: 10, marginBottom: 6 },
-  modalText: { color: "#e5e7eb", lineHeight: 18 },
-  sourceRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 6 },
-  sourceText: { color: "#9ca3af", fontWeight: "800" },
-  modalFoot: { color: "#6b7280", fontSize: 12, marginTop: 12, lineHeight: 16 },
+  smallMore: {
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+  },
+  smallMoreText: { color: "white", fontWeight: "900", fontSize: 12 },
+
+  moreBtn: {
+    marginTop: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    alignSelf: "flex-start",
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+  },
+  moreText: { color: "white", fontWeight: "900", fontSize: 12 },
+
+  footer: { marginTop: 6, paddingTop: 10 },
+  footerText: { color: "rgba(255,255,255,0.55)", fontSize: 11, lineHeight: 15 },
 });
-

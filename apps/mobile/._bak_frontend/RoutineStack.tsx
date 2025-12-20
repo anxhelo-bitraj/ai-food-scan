@@ -3,12 +3,10 @@ import { createNativeStackNavigator } from "@react-navigation/native-stack";
 
 import RoutineScreen from "../screens/RoutineScreen";
 import InteractionCheckScreen from "../screens/InteractionCheckScreen";
-import SettingsScreen from "../screens/SettingsScreen";
 
 export type RoutineStackParamList = {
   RoutineHome: undefined;
   InteractionCheck: undefined;
-  Settings: undefined;
 };
 
 const Stack = createNativeStackNavigator<RoutineStackParamList>();
@@ -18,14 +16,16 @@ export default function RoutineStack() {
     <Stack.Navigator
       screenOptions={{
         headerStyle: { backgroundColor: "#0b0f14" },
-        headerTintColor: "white",
+        headerTintColor: "#e5e7eb",
         contentStyle: { backgroundColor: "#0b0f14" },
-        headerShadowVisible: false,
       }}
     >
       <Stack.Screen name="RoutineHome" component={RoutineScreen} options={{ title: "Routine" }} />
-      <Stack.Screen name="InteractionCheck" component={InteractionCheckScreen} options={{ title: "Interactions" }} />
-      <Stack.Screen name="Settings" component={SettingsScreen} options={{ title: "Preferences" }} />
+      <Stack.Screen
+        name="InteractionCheck"
+        component={InteractionCheckScreen}
+        options={{ title: "Interaction check" }}
+      />
     </Stack.Navigator>
   );
 }
