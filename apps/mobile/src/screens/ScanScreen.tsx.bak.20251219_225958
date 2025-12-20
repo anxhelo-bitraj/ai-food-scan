@@ -1,8 +1,7 @@
-import React, { useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { CameraView, useCameraPermissions } from "expo-camera";
-import { useFocusEffect } from "@react-navigation/native";
 import { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import ModeDock, { ModeItem, ScanModeKey } from "../components/ModeDock";
@@ -20,36 +19,30 @@ const MODES: ModeItem[] = [
 
 export default function ScanScreen({ navigation }: Props) {
   const [permission, requestPermission] = useCameraPermissions();
-
   const [mode, setMode] = useState<ScanModeKey>("scanner");
   const [lastCode, setLastCode] = useState<string>("—");
 
-  // Prevent multiple navigations from one barcode held in view
+  // prevent double scans
   const lastScanRef = useRef<{ code: string; at: number }>({ code: "", at: 0 });
-  const navigatingRef = useRef(false);
   const DEBOUNCE_MS = 1200;
 
-  // When we come back to Scan, allow scanning again
-  useFocusEffect(
-    React.useCallback(() => {
-      navigatingRef.current = false;
-      lastScanRef.current = { code: "", at: 0 };
-      return () => {};
-    }, [])
-  );
+  useEffect(() => {
+    if (!permission) return;
+    if (!permission.granted) requestPermission();
+  }, [permission, requestPermission]);
 
   const hint = useMemo(() => {
     switch (mode) {
       case "scanner":
         return "Scan a barcode";
       case "ai":
-        return "AI mode (coming next)";
+        return "AI shelf scan (coming soon)";
       case "allergy":
-        return "Allergy scan (uses Product page)";
+        return "Allergy lens (coming soon)";
       case "diet":
-        return "Diet scan (uses Product page)";
+        return "Diet lens (coming soon)";
       case "eco":
-        return "Eco scan (uses Product page)";
+        return "Eco lens (coming soon)";
     }
   }, [mode]);
 
@@ -68,7 +61,9 @@ export default function ScanScreen({ navigation }: Props) {
         <Text style={styles.link} onPress={requestPermission}>
           Tap to grant permission
         </Text>
-        <Text style={styles.small}>If it still fails: iPhone Settings → Expo Go → Camera → ON</Text>
+        <Text style={styles.small}>
+          If it still fails: iPhone Settings → Expo Go → Camera → ON
+        </Text>
       </SafeAreaView>
     );
   }
@@ -78,13 +73,10 @@ export default function ScanScreen({ navigation }: Props) {
       <View style={styles.preview}>
         <CameraView
           style={StyleSheet.absoluteFill}
-          facing="back"
           onBarcodeScanned={
             mode !== "scanner"
               ? undefined
               : (scan) => {
-                  if (navigatingRef.current) return;
-
                   const code = (scan?.data ?? "").trim();
                   const now = Date.now();
                   if (!code) return;
@@ -93,11 +85,9 @@ export default function ScanScreen({ navigation }: Props) {
                   if (prev.code === code && now - prev.at < DEBOUNCE_MS) return;
 
                   lastScanRef.current = { code, at: now };
-                  navigatingRef.current = true;
-
                   setLastCode(code);
 
-                  // ✅ This is the behavior you want: go to the Product page
+                  // ✅ navigate to Product screen
                   navigation.navigate("Product", { barcode: code });
                 }
           }
@@ -116,7 +106,9 @@ export default function ScanScreen({ navigation }: Props) {
         <Text style={styles.value}>{lastCode}</Text>
 
         <Text style={styles.small}>
-          Scanning opens the Product page (placeholders). Backend wiring comes later.
+          Note: barcode scanning works in <Text style={{ fontWeight: "800", color: "white" }}>Scanner</Text> mode.
+          {"\n"}
+          iOS Simulator won’t scan real barcodes — use your phone with Expo Go.
         </Text>
       </View>
     </SafeAreaView>

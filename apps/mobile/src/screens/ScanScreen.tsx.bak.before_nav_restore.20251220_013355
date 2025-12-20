@@ -1,0 +1,308 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { ActivityIndicator, Image, StyleSheet, Text, View } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { CameraView, useCameraPermissions } from "expo-camera";
+import { useIsFocused } from "@react-navigation/native";
+import ModeDock, { ModeItem, ScanModeKey } from "../components/ModeDock";
+
+type OffProduct = {
+  code: string;
+  product_name?: string;
+  brands?: string;
+  ingredients_text?: string;
+  image_front_url?: string;
+
+  allergens?: string;
+  allergens_tags?: string[];
+
+  nutriments?: Record<string, any>;
+  nutrition_grade_fr?: string;
+  nova_group?: number;
+
+  ecoscore_grade?: string;
+  ecoscore_score?: number;
+};
+
+async function fetchOffProduct(barcode: string, signal?: AbortSignal): Promise<OffProduct | null> {
+  const url =
+    `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}` +
+    `?fields=code,product_name,brands,ingredients_text,image_front_url,status,allergens,allergens_tags,nutriments,nutrition_grade_fr,nova_group,ecoscore_grade,ecoscore_score`;
+
+  const res = await fetch(url, { signal });
+  if (!res.ok) return null;
+
+  const json = await res.json();
+  if (!json || json.status !== 1) return null;
+
+  return json.product as OffProduct;
+}
+
+const MODES: ModeItem[] = [
+  { key: "scanner", label: "Scanner", icon: "barcode-outline" },
+  { key: "ai", label: "AI", icon: "sparkles-outline" },
+  { key: "allergy", label: "Allergy", icon: "alert-circle-outline" },
+  { key: "diet", label: "Diet", icon: "nutrition-outline" },
+  { key: "eco", label: "Eco", icon: "leaf-outline" },
+];
+
+function prettyGrade(g?: string) {
+  if (!g) return "—";
+  return g.toUpperCase();
+}
+
+function num(v: any): number | null {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+export default function ScanScreen() {
+  const isFocused = useIsFocused();
+  const [permission, requestPermission] = useCameraPermissions();
+
+  const [mode, setMode] = useState<ScanModeKey>("scanner");
+
+  const [lastCode, setLastCode] = useState<string>("—");
+  const [loading, setLoading] = useState(false);
+  const [product, setProduct] = useState<OffProduct | null>(null);
+  const [error, setError] = useState<string>("");
+
+  const lastScanRef = useRef<{ code: string; at: number }>({ code: "", at: 0 });
+  const abortRef = useRef<AbortController | null>(null);
+
+  const DEBOUNCE_MS = 1200;
+
+  useEffect(() => {
+    if (!permission) return;
+    if (!permission.granted) requestPermission();
+  }, [permission, requestPermission]);
+
+  // Fetch OFF when barcode changes (so you can switch modes after scanning)
+  useEffect(() => {
+    const code = lastCode.trim();
+    if (!code || code === "—") return;
+
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+
+    setLoading(true);
+    setError("");
+    setProduct(null);
+
+    fetchOffProduct(code, ac.signal)
+      .then((p) => {
+        if (ac.signal.aborted) return;
+        if (!p) setError("Not found on OpenFoodFacts.");
+        setProduct(p);
+      })
+      .catch(() => {
+        if (ac.signal.aborted) return;
+        setError("Network/error fetching product.");
+      })
+      .finally(() => {
+        if (ac.signal.aborted) return;
+        setLoading(false);
+      });
+
+    return () => ac.abort();
+  }, [lastCode]);
+
+  const hint = useMemo(() => {
+    switch (mode) {
+      case "scanner":
+        return "Scan a barcode";
+      case "ai":
+        return "AI mode (beta)";
+      case "allergy":
+        return "Scan, then check allergens";
+      case "diet":
+        return "Scan, then check nutrition";
+      case "eco":
+        return "Scan, then check eco score";
+    }
+  }, [mode]);
+
+  // Derived cards
+  const allergensText = useMemo(() => {
+    if (!product) return "—";
+    if (product.allergens && product.allergens.trim()) return product.allergens;
+    if (product.allergens_tags?.length) return product.allergens_tags.join(", ");
+    return "—";
+  }, [product]);
+
+  const kcal100g = useMemo(() => {
+    const n = product?.nutriments ? num(product.nutriments["energy-kcal_100g"]) : null;
+    return n == null ? "—" : `${Math.round(n)} kcal / 100g`;
+  }, [product]);
+
+  const sugar100g = useMemo(() => {
+    const n = product?.nutriments ? num(product.nutriments["sugars_100g"]) : null;
+    return n == null ? "—" : `${n.toFixed(1)}g sugar / 100g`;
+  }, [product]);
+
+  const salt100g = useMemo(() => {
+    const n = product?.nutriments ? num(product.nutriments["salt_100g"]) : null;
+    return n == null ? "—" : `${n.toFixed(2)}g salt / 100g`;
+  }, [product]);
+
+  const eco = useMemo(() => {
+    if (!product) return "—";
+    const g = product.ecoscore_grade ? prettyGrade(product.ecoscore_grade) : "—";
+    const s = product.ecoscore_score != null ? `${product.ecoscore_score}` : "—";
+    return `EcoScore: ${g}  •  Score: ${s}`;
+  }, [product]);
+
+  if (!permission) {
+    return (
+      <SafeAreaView style={styles.center}>
+        <Text style={styles.text}>Requesting camera permission…</Text>
+      </SafeAreaView>
+    );
+  }
+
+  if (!permission.granted) {
+    return (
+      <SafeAreaView style={styles.center}>
+        <Text style={styles.text}>Camera permission is required.</Text>
+        <Text style={styles.link} onPress={requestPermission}>
+          Tap to grant permission
+        </Text>
+        <Text style={styles.small}>If it still fails: iPhone Settings → Expo Go → Camera → ON</Text>
+      </SafeAreaView>
+    );
+  }
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <View style={styles.preview}>
+        {isFocused ? (
+          <CameraView
+            style={StyleSheet.absoluteFill}
+            facing="back"
+            // Keep barcode scanning ONLY in Scanner mode for now
+            onBarcodeScanned={
+              mode !== "scanner"
+                ? undefined
+                : (scan) => {
+                    const code = (scan?.data ?? "").trim();
+                    const now = Date.now();
+                    if (!code) return;
+
+                    const prev = lastScanRef.current;
+                    if (prev.code === code && now - prev.at < DEBOUNCE_MS) return;
+
+                    lastScanRef.current = { code, at: now };
+                    setLastCode(code);
+                  }
+            }
+          />
+        ) : (
+          <View style={StyleSheet.absoluteFill} />
+        )}
+
+        <View style={styles.overlay}>
+          <View style={styles.scanBox} />
+          <Text style={styles.hint}>{hint}</Text>
+        </View>
+      </View>
+
+      <View style={styles.panel}>
+        <ModeDock modes={MODES} value={mode} onChange={setMode} />
+
+        <Text style={styles.label}>Last scan</Text>
+        <Text style={styles.value}>{lastCode}</Text>
+
+        {loading ? (
+          <View style={{ marginTop: 10 }}>
+            <ActivityIndicator />
+            <Text style={styles.small}>Fetching product details…</Text>
+          </View>
+        ) : null}
+
+        {!loading && error ? <Text style={styles.error}>{error}</Text> : null}
+
+        {!loading && product ? (
+          <View style={styles.card}>
+            {product.image_front_url ? (
+              <Image source={{ uri: product.image_front_url }} style={styles.image} resizeMode="contain" />
+            ) : null}
+
+            <Text style={styles.pTitle}>{product.product_name || "—"}</Text>
+            <Text style={styles.pMeta}>Brand: {product.brands || "—"}</Text>
+
+            {mode === "scanner" ? (
+              <>
+                <Text style={[styles.label, { marginTop: 10 }]}>Ingredients</Text>
+                <Text style={styles.ingredients}>{product.ingredients_text || "—"}</Text>
+              </>
+            ) : null}
+
+            {mode === "ai" ? <Text style={styles.small}>AI mode comes next (camera recognition).</Text> : null}
+
+            {mode === "allergy" ? (
+              <>
+                <Text style={[styles.label, { marginTop: 10 }]}>Allergens (from OFF)</Text>
+                <Text style={styles.ingredients}>{allergensText}</Text>
+              </>
+            ) : null}
+
+            {mode === "diet" ? (
+              <>
+                <Text style={[styles.label, { marginTop: 10 }]}>Diet snapshot</Text>
+                <Text style={styles.ingredients}>
+                  {kcal100g}{"\n"}
+                  {sugar100g}{"\n"}
+                  {salt100g}{"\n"}
+                  Nutrition grade: {prettyGrade(product.nutrition_grade_fr)}{"\n"}
+                  NOVA group: {product.nova_group ?? "—"}
+                </Text>
+              </>
+            ) : null}
+
+            {mode === "eco" ? (
+              <>
+                <Text style={[styles.label, { marginTop: 10 }]}>Environmental</Text>
+                <Text style={styles.ingredients}>{eco}</Text>
+              </>
+            ) : null}
+          </View>
+        ) : (
+          <Text style={styles.small}>Tip: switch to Scanner mode, scan a barcode, then swipe modes to see analysis.</Text>
+        )}
+
+        <Text style={styles.small}>Note: iOS Simulator won’t scan real barcodes (use your iPhone).</Text>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#0b0f14" },
+  preview: { flex: 1, backgroundColor: "#000" },
+  overlay: { ...StyleSheet.absoluteFillObject, alignItems: "center", justifyContent: "center" },
+  scanBox: {
+    width: "78%",
+    height: 180,
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.9)",
+    borderRadius: 14,
+    backgroundColor: "rgba(0,0,0,0.10)",
+  },
+  hint: { marginTop: 14, color: "white", fontSize: 16, fontWeight: "700" },
+
+  panel: { padding: 16, borderTopWidth: 1, borderTopColor: "#1f2937" },
+  label: { color: "#9ca3af", fontSize: 12, marginTop: 10 },
+  value: { color: "white", fontSize: 18, fontWeight: "800", marginTop: 4 },
+  small: { marginTop: 10, color: "#9ca3af", fontSize: 12, lineHeight: 16 },
+  error: { color: "#f87171", fontWeight: "800", marginTop: 10 },
+
+  card: { marginTop: 10, borderWidth: 1, borderColor: "#1f2937", borderRadius: 14, padding: 12 },
+  image: { width: "100%", height: 160, marginBottom: 8 },
+  pTitle: { color: "white", fontSize: 18, fontWeight: "900" },
+  pMeta: { color: "#cbd5e1", marginTop: 4, fontWeight: "700" },
+  ingredients: { color: "white", marginTop: 6, lineHeight: 18 },
+
+  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: "#0b0f14" },
+  text: { color: "white", textAlign: "center", marginBottom: 10 },
+  link: { color: "#93c5fd", fontWeight: "800" },
+});

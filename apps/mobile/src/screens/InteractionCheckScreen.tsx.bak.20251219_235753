@@ -1,0 +1,228 @@
+import React, {useMemo, useState, useCallback} from "react";
+import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { Ionicons } from "@expo/vector-icons";
+import { useFocusEffect } from "@react-navigation/native";
+
+type RoutineItem = { id: string; name: string; barcode?: string };
+
+type Interaction = {
+  id: string;
+  title: string;
+  severity: "Low" | "Medium" | "High";
+  confidence: "Low" | "Medium" | "High";
+  why: string;
+  whatToDo: string;
+  sources: { label: string; url: string }[];
+};
+
+function getRoutineStore(): RoutineItem[] {
+  const g: any = globalThis as any;
+  if (!g.__routineItems) g.__routineItems = [];
+  return g.__routineItems as RoutineItem[];
+}
+
+function badgeColor(level: string) {
+  if (level === "High") return "#ef4444";
+  if (level === "Medium") return "#f59e0b";
+  return "#22c55e";
+}
+
+export default function InteractionCheckScreen() {
+  const [items, setItems] = useState<RoutineItem[]>(() => [...getRoutineStore()]);
+  const [open, setOpen] = useState<Interaction | null>(null);
+
+  const refresh = useCallback(() => {
+    setItems([...getRoutineStore()]);
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      refresh();
+      return () => {};
+    }, [refresh])
+  );
+
+
+  // Placeholder interaction engine
+  const interactions: Interaction[] = useMemo(() => {
+    if (items.length < 2) return [];
+    return [
+      {
+        id: "ex-1",
+        title: "Colouring + high sugar intake (example)",
+        severity: "Medium",
+        confidence: "Low",
+        why:
+          "Placeholder: some combinations may worsen outcomes for sensitive individuals; evidence varies by additive and dose.",
+        whatToDo:
+          "Placeholder: reduce frequency, swap one item, and monitor symptoms if you’re sensitive.",
+        sources: [
+          { label: "Source placeholder 1", url: "https://example.com/source-1" },
+          { label: "Source placeholder 2", url: "https://example.com/source-2" },
+        ],
+      },
+      {
+        id: "ex-2",
+        title: "Preservative combo (example)",
+        severity: "High",
+        confidence: "Low",
+        why:
+          "Placeholder: certain additive combinations may increase irritation risk for some users; strength of evidence varies.",
+        whatToDo:
+          "Placeholder: replace one product or choose additive-free options where possible.",
+        sources: [{ label: "Source placeholder A", url: "https://example.com/source-a" }],
+      },
+    ];
+  }, [items]);
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <ScrollView contentContainerStyle={styles.scroll}>
+        <Text style={styles.title}>Interaction check</Text>
+        <Text style={styles.subtitle}>
+          Placeholder engine for now. Later we’ll compute additive interactions using your backend + evidence rules.
+        </Text>
+
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Items considered</Text>
+          {items.length === 0 ? (
+            <Text style={styles.muted}>No routine items found.</Text>
+          ) : (
+            items.map((it) => (
+              <View key={it.id} style={styles.itemRow}>
+                <Ionicons name="cube-outline" size={16} color="#9ca3af" />
+                <Text style={styles.itemText}>
+                  {it.name} <Text style={styles.muted}>({it.barcode ?? "—"})</Text>
+                </Text>
+              </View>
+            ))
+          )}
+        </View>
+
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Alerts</Text>
+
+          {interactions.length === 0 ? (
+            <Text style={styles.muted}>Add at least 2 items in Routine to see example alerts.</Text>
+          ) : (
+            interactions.map((x) => (
+              <View key={x.id} style={styles.alertRow}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.alertTitle}>{x.title}</Text>
+                  <Text style={styles.muted} numberOfLines={2}>{x.why}</Text>
+
+                  <View style={styles.badgeRow}>
+                    <View style={[styles.badge, { backgroundColor: badgeColor(x.severity) }]}>
+                      <Text style={styles.badgeText}>Severity: {x.severity}</Text>
+                    </View>
+                    <View style={[styles.badge, styles.badgeOutline]}>
+                      <Text style={[styles.badgeText, { color: "#e5e7eb" }]}>Confidence: {x.confidence}</Text>
+                    </View>
+                  </View>
+                </View>
+
+                <Pressable style={styles.moreBtn} onPress={() => setOpen(x)}>
+                  <Text style={styles.moreText}>More</Text>
+                </Pressable>
+              </View>
+            ))
+          )}
+        </View>
+      </ScrollView>
+
+      <Modal visible={!!open} transparent animationType="slide" onRequestClose={() => setOpen(null)}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalSheet}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>{open?.title}</Text>
+              <Pressable onPress={() => setOpen(null)} style={styles.closeBtn}>
+                <Ionicons name="close" size={22} color="#e5e7eb" />
+              </Pressable>
+            </View>
+
+            <ScrollView>
+              <Text style={styles.modalSection}>Why it matters</Text>
+              <Text style={styles.modalText}>{open?.why}</Text>
+
+              <Text style={styles.modalSection}>What you can do</Text>
+              <Text style={styles.modalText}>{open?.whatToDo}</Text>
+
+              <Text style={styles.modalSection}>Sources</Text>
+              {(open?.sources ?? []).map((s) => (
+                <View key={s.url} style={styles.sourceRow}>
+                  <Ionicons name="link-outline" size={16} color="#9ca3af" />
+                  <Text style={styles.sourceText}>{s.label}</Text>
+                </View>
+              ))}
+
+              <Text style={styles.modalFoot}>
+                Placeholder: later you’ll show real sources, confidence, and last-reviewed date per interaction rule.
+              </Text>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#0b0f14" },
+  scroll: { padding: 16, paddingBottom: 28 },
+
+  title: { color: "white", fontSize: 22, fontWeight: "900" },
+  subtitle: { color: "#9ca3af", marginTop: 6, lineHeight: 18 },
+
+  card: {
+    marginTop: 12,
+    backgroundColor: "#111827",
+    borderWidth: 1,
+    borderColor: "#1f2937",
+    borderRadius: 18,
+    padding: 14,
+  },
+  cardTitle: { color: "white", fontSize: 16, fontWeight: "900", marginBottom: 10 },
+
+  muted: { color: "#9ca3af", lineHeight: 18 },
+  itemRow: { flexDirection: "row", gap: 8, alignItems: "center", paddingVertical: 6 },
+  itemText: { color: "#e5e7eb", fontWeight: "800" },
+
+  alertRow: {
+    flexDirection: "row",
+    gap: 10,
+    paddingVertical: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#1f2937",
+    alignItems: "flex-start",
+  },
+  alertTitle: { color: "#e5e7eb", fontWeight: "900", marginBottom: 4 },
+
+  badgeRow: { flexDirection: "row", gap: 8, marginTop: 10, flexWrap: "wrap" },
+  badge: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
+  badgeOutline: { backgroundColor: "#111827", borderWidth: 1, borderColor: "#1f2937" },
+  badgeText: { color: "#0b0f14", fontWeight: "900", fontSize: 12 },
+
+  moreBtn: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 999, borderWidth: 1, borderColor: "#334155" },
+  moreText: { color: "#93c5fd", fontWeight: "900" },
+
+  modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.55)", justifyContent: "flex-end" },
+  modalSheet: {
+    backgroundColor: "#0b0f14",
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
+    borderWidth: 1,
+    borderColor: "#1f2937",
+    padding: 16,
+    maxHeight: "80%",
+  },
+  modalHeader: { flexDirection: "row", alignItems: "flex-start", gap: 10, marginBottom: 10 },
+  modalTitle: { color: "white", fontSize: 16, fontWeight: "900", flex: 1 },
+  closeBtn: { padding: 6, borderRadius: 10, backgroundColor: "#111827", borderWidth: 1, borderColor: "#1f2937" },
+
+  modalSection: { color: "white", fontWeight: "900", marginTop: 10, marginBottom: 6 },
+  modalText: { color: "#e5e7eb", lineHeight: 18 },
+  sourceRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 6 },
+  sourceText: { color: "#9ca3af", fontWeight: "800" },
+  modalFoot: { color: "#6b7280", fontSize: 12, marginTop: 12, lineHeight: 16 },
+});

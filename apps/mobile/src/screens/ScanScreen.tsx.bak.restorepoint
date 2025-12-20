@@ -1,0 +1,234 @@
+import React, { useMemo, useRef, useState } from "react";
+import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { CameraView, useCameraPermissions } from "expo-camera";
+import { useIsFocused } from "@react-navigation/native";
+import ModeDock, { ModeItem, ScanModeKey } from "../components/ModeDock";
+
+type PlaceholderProduct = {
+  barcode: string;
+  name: string;
+  brand: string;
+  ingredients: string;
+  ecoScore: string;
+  allergens: string;
+  vegan: "Yes" | "No" | "Unknown";
+  vegetarian: "Yes" | "No" | "Unknown";
+};
+
+const MODES: ModeItem[] = [
+  { key: "scanner", label: "Scanner", icon: "barcode-outline" },
+  { key: "ai", label: "AI", icon: "sparkles-outline" },
+  { key: "allergy", label: "Allergy", icon: "alert-circle-outline" },
+  { key: "diet", label: "Diet", icon: "nutrition-outline" },
+  { key: "eco", label: "Eco", icon: "leaf-outline" },
+];
+
+function makePlaceholder(barcode: string): PlaceholderProduct {
+  return {
+    barcode,
+    name: "Product name (placeholder)",
+    brand: "Brand (placeholder)",
+    ingredients:
+      "Ingredients (placeholder): sugar, water, flavourings, colourings…\n\nLater: populated from your backend / database.",
+    ecoScore: "B (placeholder)",
+    allergens: "Milk, Soy (placeholder)",
+    vegan: "Unknown",
+    vegetarian: "Unknown",
+  };
+}
+
+export default function ScanScreen() {
+  const isFocused = useIsFocused();
+  const [permission, requestPermission] = useCameraPermissions();
+
+  const [mode, setMode] = useState<ScanModeKey>("scanner");
+
+  const [lastCode, setLastCode] = useState<string>("—");
+  const [loading, setLoading] = useState(false);
+  const [product, setProduct] = useState<PlaceholderProduct | null>(null);
+
+  const lastScanRef = useRef<{ code: string; at: number }>({ code: "", at: 0 });
+  const DEBOUNCE_MS = 1200;
+
+  const hint = useMemo(() => {
+    switch (mode) {
+      case "scanner":
+        return "Scan a barcode";
+      case "ai":
+        return "AI mode (coming later)";
+      case "allergy":
+        return "Scan, then check allergens";
+      case "diet":
+        return "Scan, then check diet info";
+      case "eco":
+        return "Scan, then check eco score";
+    }
+  }, [mode]);
+
+  if (!permission) {
+    return (
+      <SafeAreaView style={styles.center}>
+        <Text style={styles.text}>Requesting camera permission…</Text>
+      </SafeAreaView>
+    );
+  }
+
+  if (!permission.granted) {
+    return (
+      <SafeAreaView style={styles.center}>
+        <Text style={styles.text}>Camera permission is required.</Text>
+        <Text style={styles.link} onPress={requestPermission}>
+          Tap to grant permission
+        </Text>
+        <Text style={styles.small}>If it still fails: iPhone Settings → Expo Go → Camera → ON</Text>
+      </SafeAreaView>
+    );
+  }
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <View style={styles.preview}>
+        {isFocused ? (
+          <CameraView
+            style={StyleSheet.absoluteFill}
+            facing="back"
+            onBarcodeScanned={
+              mode !== "scanner"
+                ? undefined
+                : (scan) => {
+                    const code = (scan?.data ?? "").trim();
+                    const now = Date.now();
+                    if (!code) return;
+
+                    const prev = lastScanRef.current;
+                    if (prev.code === code && now - prev.at < DEBOUNCE_MS) return;
+
+                    lastScanRef.current = { code, at: now };
+
+                    setLastCode(code);
+                    setLoading(true);
+
+                    // Placeholder “fetch”
+                    const p = makePlaceholder(code);
+                    setProduct(p);
+
+                    // tiny delay so the UI shows "loading" briefly (optional)
+                    setTimeout(() => setLoading(false), 200);
+                  }
+            }
+          />
+        ) : (
+          <View style={StyleSheet.absoluteFill} />
+        )}
+
+        <View style={styles.overlay}>
+          <View style={styles.scanBox} />
+          <Text style={styles.hint}>{hint}</Text>
+        </View>
+      </View>
+
+      <View style={styles.panel}>
+        <ModeDock modes={MODES} value={mode} onChange={setMode} />
+
+        <Text style={styles.label}>Last scan</Text>
+        <Text style={styles.value}>{lastCode}</Text>
+
+        {loading ? (
+          <View style={{ marginTop: 10 }}>
+            <ActivityIndicator />
+            <Text style={styles.small}>Loading placeholder product…</Text>
+          </View>
+        ) : null}
+
+        {!loading && product ? (
+          <View style={styles.card}>
+            <Text style={styles.pTitle}>{product.name}</Text>
+            <Text style={styles.pMeta}>Brand: {product.brand}</Text>
+
+            {mode === "scanner" ? (
+              <>
+                <Text style={[styles.label, { marginTop: 10 }]}>Ingredients</Text>
+                <Text style={styles.block}>{product.ingredients}</Text>
+
+                <Text style={[styles.label, { marginTop: 10 }]}>Health score</Text>
+                <Text style={styles.block}>Health score: 72/100 (placeholder)</Text>
+
+                <Text style={[styles.label, { marginTop: 10 }]}>Additives</Text>
+                <Text style={styles.block}>E102 (placeholder), E211 (placeholder)</Text>
+              </>
+            ) : null}
+
+            {mode === "ai" ? (
+              <Text style={styles.block}>
+                AI shelf recognition (placeholder). Later: detect product/label straight from shelf view.
+              </Text>
+            ) : null}
+
+            {mode === "allergy" ? (
+              <>
+                <Text style={[styles.label, { marginTop: 10 }]}>Allergens</Text>
+                <Text style={styles.block}>{product.allergens}</Text>
+              </>
+            ) : null}
+
+            {mode === "diet" ? (
+              <>
+                <Text style={[styles.label, { marginTop: 10 }]}>Diet</Text>
+                <Text style={styles.block}>
+                  Vegan: {product.vegan} (placeholder){"\n"}
+                  Vegetarian: {product.vegetarian} (placeholder){"\n"}
+                  Later: compute from ingredients + user preferences.
+                </Text>
+              </>
+            ) : null}
+
+            {mode === "eco" ? (
+              <>
+                <Text style={[styles.label, { marginTop: 10 }]}>Environmental</Text>
+                <Text style={styles.block}>Eco score: {product.ecoScore}</Text>
+              </>
+            ) : null}
+          </View>
+        ) : (
+          <Text style={styles.small}>
+            Tip: switch to Scanner mode, scan a barcode, then swipe modes to see placeholders.
+          </Text>
+        )}
+
+        <Text style={styles.small}>Note: iOS Simulator won’t scan real barcodes (use your iPhone).</Text>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#0b0f14" },
+
+  preview: { flex: 1, backgroundColor: "#000" },
+  overlay: { ...StyleSheet.absoluteFillObject, alignItems: "center", justifyContent: "center" },
+
+  scanBox: {
+    width: "78%",
+    height: 180,
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.9)",
+    borderRadius: 14,
+    backgroundColor: "rgba(0,0,0,0.10)",
+  },
+  hint: { marginTop: 14, color: "white", fontSize: 16, fontWeight: "700" },
+
+  panel: { padding: 16, borderTopWidth: 1, borderTopColor: "#1f2937" },
+  label: { color: "#9ca3af", fontSize: 12, marginTop: 10 },
+  value: { color: "white", fontSize: 18, fontWeight: "800", marginTop: 4 },
+  small: { marginTop: 10, color: "#9ca3af", fontSize: 12, lineHeight: 16 },
+
+  card: { marginTop: 10, borderWidth: 1, borderColor: "#1f2937", borderRadius: 14, padding: 12 },
+  pTitle: { color: "white", fontSize: 18, fontWeight: "900" },
+  pMeta: { color: "#cbd5e1", marginTop: 4, fontWeight: "700" },
+  block: { color: "white", marginTop: 6, lineHeight: 18 },
+
+  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: "#0b0f14" },
+  text: { color: "white", textAlign: "center", marginBottom: 10 },
+  link: { color: "#93c5fd", fontWeight: "800" },
+});

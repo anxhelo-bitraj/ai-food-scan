@@ -4,12 +4,11 @@ import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import { Ionicons } from "@expo/vector-icons";
 
 import ScanStack from "./ScanStack";
-import RoutineStack from "./RoutineStack";
 import InsightsScreen from "../screens/InsightsScreen";
 import HistoryScreen from "../screens/HistoryScreen";
+
 export type RootTabParamList = {
   Scan: undefined;
-  Routine: undefined;
   Insights: undefined;
   History: undefined;
 };
@@ -33,8 +32,6 @@ export default function RootTabs() {
             const icon =
               route.name === "Scan"
                 ? "scan-outline"
-                : route.name === "Routine"
-                ? "layers-outline"
                 : route.name === "Insights"
                 ? "sparkles-outline"
                 : "time-outline";
@@ -43,7 +40,6 @@ export default function RootTabs() {
         })}
       >
         <Tab.Screen name="Scan" component={ScanStack} options={{ headerShown: false }} />
-        <Tab.Screen name="Routine" component={RoutineStack} options={{ title: "Routine" }} />
         <Tab.Screen name="Insights" component={InsightsScreen} />
         <Tab.Screen name="History" component={HistoryScreen} />
       </Tab.Navigator>
