@@ -1,108 +1,19 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Alert, Animated, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
+import * as Haptics from "expo-haptics";
 import { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { ScanStackParamList, ProductTabKey } from "../navigation/ScanStack";
 import Chip from "../components/Chip";
 import InfoSheet from "../components/InfoSheet";
 import { upsertRoutineItem } from "../store/routineStore";
+import { getPreferences } from "../store/preferencesStore";
+import { buildPlaceholderProduct, computeAdditivesRisk, computeAllergensCount } from "../utils/placeholderProduct";
 
 type Props = NativeStackScreenProps<ScanStackParamList, "Product">;
 type TabKey = ProductTabKey;
-
-type Additive = {
-  code: string;
-  name: string;
-  level: "Low" | "Medium" | "High";
-  why: string;
-};
-
-type ProductVM = {
-  barcode: string;
-  name: string;
-  brand: string;
-
-  healthScore: number; // 0-100
-  additives: Additive[];
-  allergens: { name: string; status: "Contains" | "May contain" | "Not listed" }[];
-  vegan: "Yes" | "No" | "Unknown";
-  vegetarian: "Yes" | "No" | "Unknown";
-  eco: { grade: "A" | "B" | "C" | "D" | "E"; summary: string };
-
-  sources: { label: string; url?: string }[];
-};
-
-function seededNumber(barcode: string) {
-  let x = 0;
-  for (let i = 0; i < barcode.length; i++) x = (x * 31 + barcode.charCodeAt(i)) >>> 0;
-  return x;
-}
-
-function buildPlaceholderProduct(barcode: string): ProductVM {
-  const seed = seededNumber(barcode);
-  const healthScore = 40 + (seed % 56); // 40..95
-  const grades: ProductVM["eco"]["grade"][] = ["A", "B", "C", "D", "E"];
-  const eco = grades[(seed >>> 3) % grades.length];
-
-  const vegan: ProductVM["vegan"] = (seed % 3) === 0 ? "Yes" : (seed % 3) === 1 ? "No" : "Unknown";
-  const vegetarian: ProductVM["vegetarian"] = (seed % 4) === 0 ? "Yes" : (seed % 4) === 1 ? "No" : "Unknown";
-
-  const additives: Additive[] = [
-    {
-      code: "E102",
-      name: "Tartrazine (placeholder)",
-      level: "High",
-      why: "Placeholder: associated with sensitivity reactions in some people. Later: replace with evidence-based text + citations.",
-    },
-    {
-      code: "E211",
-      name: "Sodium benzoate (placeholder)",
-      level: "Medium",
-      why: "Placeholder: preservative; interactions depend on dose/context. Later: connect to your backend + sources.",
-    },
-    {
-      code: "E330",
-      name: "Citric acid (placeholder)",
-      level: "Low",
-      why: "Placeholder: common acidifier; typically low concern for most users.",
-    },
-  ];
-
-  const allergens = [
-    { name: "Milk", status: "May contain" as const },
-    { name: "Soy", status: "Contains" as const },
-    { name: "Nuts", status: "Not listed" as const },
-    { name: "Gluten", status: "Not listed" as const },
-  ];
-
-  return {
-    barcode,
-    name: `Product (placeholder) • ${barcode.slice(-4)}`,
-    brand: "Brand (placeholder)",
-    healthScore,
-    additives,
-    allergens,
-    vegan,
-    vegetarian,
-    eco: {
-      grade: eco,
-      summary:
-        "Placeholder: Eco score will summarize packaging, sourcing, and footprint once backend is connected.",
-    },
-    sources: [
-      { label: "Example source (placeholder)", url: "https://example.com" },
-      { label: "Another placeholder reference", url: "https://example.com" },
-    ],
-  };
-}
-
-function toneForAdditive(level: Additive["level"]) {
-  if (level === "High") return "bad";
-  if (level === "Medium") return "warn";
-  return "good";
-}
 
 function toneForEco(grade: string) {
   if (grade === "A" || grade === "B") return "good";
@@ -117,25 +28,54 @@ export default function ProductScreen({ route, navigation }: Props) {
   const [tab, setTab] = useState<TabKey>(initialTab);
   const [sheet, setSheet] = useState<null | { title: string; body: string }>(null);
 
+  // Skeleton loading (UI only)
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    setLoading(true);
+    const t = setTimeout(() => setLoading(false), 220);
+    return () => clearTimeout(t);
+  }, [barcode]);
+
   const product = useMemo(() => buildPlaceholderProduct(barcode), [barcode]);
+  const prefs = useMemo(() => getPreferences(), []);
 
   useEffect(() => {
     navigation.setOptions({ title: product.name });
   }, [navigation, product.name]);
 
   useEffect(() => {
-    // when coming from scan with a specific mode
     setTab(initialTab);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [barcode, route.params?.initialTab]);
 
-  const allergensCount = product.allergens.filter((a) => a.status !== "Not listed").length;
-  const additiveRisk =
-    product.additives.some((a) => a.level === "High")
-      ? "High"
-      : product.additives.some((a) => a.level === "Medium")
-      ? "Medium"
-      : "Low";
+  // profile-based matches
+  const allergenMatches = useMemo(() => {
+    const out: string[] = [];
+    const want = prefs.allergies;
+    for (const a of product.allergens) {
+      const active =
+        (a.name === "Nuts" && want.nuts) ||
+        (a.name === "Gluten" && want.gluten) ||
+        ((a.name === "Dairy" || a.name === "Milk") && want.dairy) ||
+        (a.name === "Eggs" && want.eggs) ||
+        (a.name === "Soy" && want.soy);
+
+      if (active && a.status !== "Not listed") out.push(a.name);
+    }
+    return out;
+  }, [prefs.allergies, product.allergens]);
+
+  const dietMismatch = useMemo(() => {
+    const wantsVegan = prefs.diet.vegan;
+    const wantsVeg = prefs.diet.vegetarian;
+
+    if (wantsVegan && product.vegan === "No") return "Vegan";
+    if (wantsVeg && product.vegetarian === "No") return "Vegetarian";
+    return null;
+  }, [prefs.diet, product.vegan, product.vegetarian]);
+
+  const allergensCount = computeAllergensCount(product);
+  const additivesRisk = computeAdditivesRisk(product);
 
   const addToRoutine = () => {
     upsertRoutineItem({
@@ -144,24 +84,36 @@ export default function ProductScreen({ route, navigation }: Props) {
       name: product.name,
       brand: product.brand,
       addedAtISO: new Date().toISOString(),
+      frequency: "Daily",
       badges: {
         eco: product.eco.grade,
         vegan: product.vegan,
         vegetarian: product.vegetarian,
         allergensCount,
-        additivesRisk: additiveRisk,
+        additivesRisk,
       },
     });
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
     Alert.alert("Added to Routine", "This item is now in your daily routine list (placeholder storage).");
+  };
+
+  // Animated score bar (instead of SVG ring, no new deps)
+  const scoreAnim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const to = loading ? 0 : product.healthScore / 100;
+    Animated.timing(scoreAnim, { toValue: to, duration: 300, useNativeDriver: false }).start();
+  }, [loading, product.healthScore, scoreAnim]);
+
+  const scoreWidth = scoreAnim.interpolate({ inputRange: [0, 1], outputRange: ["0%", "100%"] });
+
+  const setTabWithHaptic = (k: TabKey) => {
+    setTab(k);
+    Haptics.selectionAsync().catch(() => {});
   };
 
   return (
     <SafeAreaView style={styles.container} edges={["bottom"]}>
-      <ScrollView
-        contentContainerStyle={{ paddingBottom: 22 }}
-        stickyHeaderIndices={[0]}
-        showsVerticalScrollIndicator={false}
-      >
+      <ScrollView contentContainerStyle={{ paddingBottom: 22 }} stickyHeaderIndices={[0]} showsVerticalScrollIndicator={false}>
         {/* Sticky top section */}
         <View style={styles.sticky}>
           <View style={styles.headerTop}>
@@ -171,34 +123,37 @@ export default function ProductScreen({ route, navigation }: Props) {
 
             <View style={{ flex: 1 }}>
               <Text style={styles.title} numberOfLines={1}>
-                {product.name}
+                {loading ? "Loading…" : product.name}
               </Text>
               <Text style={styles.subtitle} numberOfLines={1}>
-                {product.brand} • {product.barcode}
+                {loading ? " " : `${product.brand} • ${product.barcode}`}
               </Text>
             </View>
 
             <View style={styles.scorePill}>
               <Text style={styles.scoreLabel}>Score</Text>
-              <Text style={styles.scoreValue}>{product.healthScore}</Text>
+              <Text style={styles.scoreValue}>{loading ? "…" : product.healthScore}</Text>
             </View>
           </View>
 
+          {/* chips */}
           <View style={styles.chipsRow}>
-            <Chip label={`Eco ${product.eco.grade}`} tone={toneForEco(product.eco.grade) as any} />
-            <Chip label={`Vegan: ${product.vegan}`} tone={product.vegan === "Yes" ? "good" : product.vegan === "No" ? "bad" : "neutral"} />
+            <Chip label={loading ? "Eco …" : `Eco ${product.eco.grade}`} tone={toneForEco(product.eco.grade) as any} />
+            <Chip label={loading ? "Vegan …" : `Vegan: ${product.vegan}`} tone={product.vegan === "Yes" ? "good" : product.vegan === "No" ? "bad" : "neutral"} />
+            <Chip label={loading ? "Veg …" : `Veg: ${product.vegetarian}`} tone={product.vegetarian === "Yes" ? "good" : product.vegetarian === "No" ? "bad" : "neutral"} />
+
             <Chip
-              label={`Veg: ${product.vegetarian}`}
-              tone={product.vegetarian === "Yes" ? "good" : product.vegetarian === "No" ? "bad" : "neutral"}
+              label={loading ? "Allergens …" : `Allergens: ${allergensCount}`}
+              tone={allergenMatches.length ? "bad" : allergensCount ? "warn" : "good"}
             />
-            <Chip label={`Allergens: ${allergensCount}`} tone={allergensCount ? "warn" : "good"} />
+
             <Chip
-              label={`Additives: ${product.additives.length}`}
-              tone={additiveRisk === "High" ? "bad" : additiveRisk === "Medium" ? "warn" : "good"}
+              label={loading ? "Additives …" : `Additives: ${product.additives.length}`}
+              tone={additivesRisk === "High" ? "bad" : additivesRisk === "Medium" ? "warn" : "good"}
             />
           </View>
 
-          <Pressable style={styles.primaryBtn} onPress={addToRoutine}>
+          <Pressable style={styles.primaryBtn} onPress={addToRoutine} disabled={loading}>
             <Ionicons name="add-circle-outline" size={18} color="white" />
             <Text style={styles.primaryText}>Add to my Routine</Text>
           </Pressable>
@@ -208,7 +163,7 @@ export default function ProductScreen({ route, navigation }: Props) {
             {(["Health", "Additives", "Allergens", "Diet", "Eco"] as TabKey[]).map((k) => {
               const active = tab === k;
               return (
-                <Pressable key={k} onPress={() => setTab(k)} style={[styles.tab, active ? styles.tabActive : null]}>
+                <Pressable key={k} onPress={() => setTabWithHaptic(k)} style={[styles.tab, active ? styles.tabActive : null]}>
                   <Text style={[styles.tabText, active ? styles.tabTextActive : null]}>{k}</Text>
                 </Pressable>
               );
@@ -221,12 +176,15 @@ export default function ProductScreen({ route, navigation }: Props) {
           {tab === "Health" ? (
             <>
               <Card title="Health score">
-                <Text style={styles.p}>
-                  Placeholder score based on scanned barcode. Later: compute from nutrition + additives + profile.
-                </Text>
-                <Row label="Overall" value={`${product.healthScore}/100`} />
-                <Row label="Additives risk" value={additiveRisk} />
-                <Row label="Allergens flagged" value={`${allergensCount}`} />
+                <Text style={styles.p}>Placeholder score. Later: compute from nutrition + additives + profile.</Text>
+
+                <View style={styles.progressTrack}>
+                  <Animated.View style={[styles.progressFill, { width: scoreWidth }]} />
+                </View>
+
+                <Row label="Overall" value={loading ? "…" : `${product.healthScore}/100`} />
+                <Row label="Additives risk" value={loading ? "…" : additivesRisk} />
+                <Row label="Allergens flagged" value={loading ? "…" : `${allergensCount}`} />
 
                 <Pressable
                   style={styles.moreBtn}
@@ -234,7 +192,7 @@ export default function ProductScreen({ route, navigation }: Props) {
                     setSheet({
                       title: "How the Health score works (placeholder)",
                       body:
-                        "This will explain your scoring logic clearly:\n\n• Ingredient quality\n• Additives severity\n• Profile-based risks (allergies)\n\nLater you’ll show citations and a breakdown with confidence.",
+                        "Later this explains your scoring logic clearly:\n\n• Ingredient quality\n• Additives severity\n• Profile-based risks\n\nAnd shows citations + confidence.",
                     })
                   }
                 >
@@ -243,87 +201,106 @@ export default function ProductScreen({ route, navigation }: Props) {
                 </Pressable>
               </Card>
 
-              <Card title="What to improve">
-                <Text style={styles.p}>
-                  Placeholder suggestions: choose fewer additives, prefer simple ingredient lists, verify allergen
-                  statements.
-                </Text>
-              </Card>
+              {(allergenMatches.length || dietMismatch) && !loading ? (
+                <Card title="Matches your profile">
+                  {allergenMatches.length ? (
+                    <Text style={styles.p}>⚠️ Allergy match: {allergenMatches.join(", ")}.</Text>
+                  ) : null}
+                  {dietMismatch ? <Text style={[styles.p, { marginTop: 6 }]}>⚠️ Diet mismatch: not {dietMismatch}.</Text> : null}
+                </Card>
+              ) : null}
             </>
           ) : null}
 
           {tab === "Additives" ? (
-            <>
-              <Card title="Additives found (placeholder)">
-                {product.additives.map((a) => (
-                  <View key={a.code} style={styles.listRow}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.rowTitle}>
-                        {a.code} • {a.name}
-                      </Text>
-                      <Text style={styles.rowSub}>Risk: {a.level}</Text>
+            <Card title="Additives found (placeholder)">
+              {loading ? <SkeletonLines /> : null}
+
+              {!loading
+                ? product.additives.map((a) => (
+                    <View key={a.code} style={styles.listRow}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.rowTitle}>
+                          {a.code} • {a.name}
+                        </Text>
+                        <Text style={styles.rowSub}>Risk: {a.level}</Text>
+                      </View>
+
+                      <Pressable
+                        style={[
+                          styles.badge,
+                          a.level === "High" ? styles.badgeBad : a.level === "Medium" ? styles.badgeWarn : styles.badgeGood,
+                        ]}
+                        onPress={() =>
+                          setSheet({
+                            title: `${a.code} • ${a.name}`,
+                            body: a.why + "\n\nLater: evidence, confidence, and references.",
+                          })
+                        }
+                      >
+                        <Text style={styles.badgeText}>More</Text>
+                      </Pressable>
                     </View>
-
-                    <Pressable
-                      style={[styles.badge, a.level === "High" ? styles.badgeBad : a.level === "Medium" ? styles.badgeWarn : styles.badgeGood]}
-                      onPress={() =>
-                        setSheet({
-                          title: `${a.code} • ${a.name}`,
-                          body: a.why + "\n\nLater: this sheet will show evidence, confidence, and references.",
-                        })
-                      }
-                    >
-                      <Text style={styles.badgeText}>More</Text>
-                    </Pressable>
-                  </View>
-                ))}
-              </Card>
-
-              <Card title="Why additives matter">
-                <Text style={styles.p}>
-                  Good UX principle: don’t scare users—explain severity + context + alternatives, and always show sources.
-                </Text>
-              </Card>
-            </>
+                  ))
+                : null}
+            </Card>
           ) : null}
 
           {tab === "Allergens" ? (
             <Card title="Allergens (placeholder)">
-              {product.allergens.map((a) => (
-                <View key={a.name} style={styles.listRow}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.rowTitle}>{a.name}</Text>
-                    <Text style={styles.rowSub}>{a.status}</Text>
-                  </View>
-
-                  <Pressable
-                    style={styles.smallMore}
-                    onPress={() =>
-                      setSheet({
-                        title: `${a.name} • Explanation (placeholder)`,
-                        body:
-                          "Later: show why this allergen is flagged, how you detected it (label text / may contain), and the source.\n\nAlso include user preference: 'avoid completely' vs 'warn'.",
-                      })
-                    }
-                  >
-                    <Text style={styles.smallMoreText}>More</Text>
-                  </Pressable>
+              {!loading && allergenMatches.length ? (
+                <View style={styles.profileWarn}>
+                  <Ionicons name="alert-circle-outline" size={18} color="white" />
+                  <Text style={styles.profileWarnText}>Matches your allergy profile: {allergenMatches.join(", ")}</Text>
                 </View>
-              ))}
+              ) : null}
+
+              {loading ? <SkeletonLines /> : null}
+
+              {!loading
+                ? product.allergens.map((a) => (
+                    <View key={a.name} style={styles.listRow}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.rowTitle}>{a.name}</Text>
+                        <Text style={styles.rowSub}>{a.status}</Text>
+                      </View>
+
+                      <Pressable
+                        style={styles.smallMore}
+                        onPress={() =>
+                          setSheet({
+                            title: `${a.name} • Explanation (placeholder)`,
+                            body:
+                              "Later: show why this allergen is flagged and the evidence (label parsing / may contain) + citations.",
+                          })
+                        }
+                      >
+                        <Text style={styles.smallMoreText}>More</Text>
+                      </Pressable>
+                    </View>
+                  ))
+                : null}
             </Card>
           ) : null}
 
           {tab === "Diet" ? (
             <Card title="Diet compatibility (placeholder)">
-              <Row label="Vegan" value={product.vegan} />
-              <Row label="Vegetarian" value={product.vegetarian} />
+              {dietMismatch && !loading ? (
+                <View style={styles.profileWarn}>
+                  <Ionicons name="alert-circle-outline" size={18} color="white" />
+                  <Text style={styles.profileWarnText}>This product conflicts with your preference: {dietMismatch}</Text>
+                </View>
+              ) : null}
+
+              <Row label="Vegan" value={loading ? "…" : product.vegan} />
+              <Row label="Vegetarian" value={loading ? "…" : product.vegetarian} />
+
               <Pressable
                 style={styles.moreBtn}
                 onPress={() =>
                   setSheet({
                     title: "How vegan/vegetarian is determined (placeholder)",
-                    body:
-                      "Later: use ingredients + additives + traces.\n\nAlso show uncertain cases as 'Unknown' with an explanation instead of guessing.",
+                    body: "Later: use ingredients + additives + traces, and explain unknown cases clearly.",
                   })
                 }
               >
@@ -335,15 +312,15 @@ export default function ProductScreen({ route, navigation }: Props) {
 
           {tab === "Eco" ? (
             <Card title="Environmental impact (placeholder)">
-              <Row label="Eco score" value={product.eco.grade} />
-              <Text style={styles.p}>{product.eco.summary}</Text>
+              <Row label="Eco score" value={loading ? "…" : product.eco.grade} />
+              <Text style={styles.p}>{loading ? " " : product.eco.summary}</Text>
+
               <Pressable
                 style={styles.moreBtn}
                 onPress={() =>
                   setSheet({
                     title: `Eco score ${product.eco.grade} • Details (placeholder)`,
-                    body:
-                      "Later: show breakdown:\n\n• Packaging\n• Origin\n• Farming method\n• Transport\n\nAnd show citations per component.",
+                    body: "Later: show packaging/origin/farming/transport breakdown + citations.",
                   })
                 }
               >
@@ -355,20 +332,13 @@ export default function ProductScreen({ route, navigation }: Props) {
 
           <View style={styles.footer}>
             <Text style={styles.footerText}>
-              Disclaimer: placeholder UI. Not medical advice. Always check labels and consult professionals for
-              health decisions.
+              Disclaimer: placeholder UI. Not medical advice. Always check labels and consult professionals for health decisions.
             </Text>
           </View>
         </View>
       </ScrollView>
 
-      <InfoSheet
-        visible={!!sheet}
-        title={sheet?.title ?? ""}
-        body={sheet?.body ?? ""}
-        sources={product.sources}
-        onClose={() => setSheet(null)}
-      />
+      <InfoSheet visible={!!sheet} title={sheet?.title ?? ""} body={sheet?.body ?? ""} sources={product.sources} onClose={() => setSheet(null)} />
     </SafeAreaView>
   );
 }
@@ -387,6 +357,16 @@ function Row({ label, value }: { label: string; value: string }) {
     <View style={styles.kvRow}>
       <Text style={styles.k}>{label}</Text>
       <Text style={styles.v}>{value}</Text>
+    </View>
+  );
+}
+
+function SkeletonLines() {
+  return (
+    <View style={{ gap: 10, marginTop: 8 }}>
+      <View style={styles.skelLine} />
+      <View style={[styles.skelLine, { width: "82%" }]} />
+      <View style={[styles.skelLine, { width: "66%" }]} />
     </View>
   );
 }
@@ -445,11 +425,7 @@ const styles = StyleSheet.create({
   },
   primaryText: { color: "white", fontWeight: "900" },
 
-  tabs: {
-    flexDirection: "row",
-    gap: 8,
-    marginTop: 12,
-  },
+  tabs: { flexDirection: "row", gap: 8, marginTop: 12 },
   tab: {
     paddingVertical: 9,
     paddingHorizontal: 12,
@@ -490,12 +466,7 @@ const styles = StyleSheet.create({
   rowTitle: { color: "white", fontWeight: "900" },
   rowSub: { color: "rgba(255,255,255,0.65)", fontWeight: "800", marginTop: 3, fontSize: 12 },
 
-  badge: {
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    borderRadius: 999,
-    borderWidth: 1,
-  },
+  badge: { paddingVertical: 8, paddingHorizontal: 10, borderRadius: 999, borderWidth: 1 },
   badgeText: { color: "white", fontWeight: "900", fontSize: 12 },
   badgeGood: { backgroundColor: "rgba(34,197,94,0.10)", borderColor: "rgba(34,197,94,0.22)" },
   badgeWarn: { backgroundColor: "rgba(245,158,11,0.12)", borderColor: "rgba(245,158,11,0.24)" },
@@ -525,6 +496,39 @@ const styles = StyleSheet.create({
     borderColor: "rgba(255,255,255,0.16)",
   },
   moreText: { color: "white", fontWeight: "900", fontSize: 12 },
+
+  profileWarn: {
+    flexDirection: "row",
+    gap: 8,
+    alignItems: "center",
+    padding: 10,
+    borderRadius: 14,
+    backgroundColor: "rgba(239,68,68,0.12)",
+    borderWidth: 1,
+    borderColor: "rgba(239,68,68,0.24)",
+    marginBottom: 10,
+  },
+  profileWarnText: { color: "white", fontWeight: "900", fontSize: 12, flex: 1 },
+
+  progressTrack: {
+    height: 10,
+    borderRadius: 999,
+    overflow: "hidden",
+    backgroundColor: "rgba(255,255,255,0.07)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+    marginTop: 10,
+  },
+  progressFill: { height: "100%", backgroundColor: "rgba(56,189,248,0.32)" },
+
+  skelLine: {
+    height: 12,
+    width: "92%",
+    borderRadius: 999,
+    backgroundColor: "rgba(255,255,255,0.07)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
 
   footer: { marginTop: 6, paddingTop: 10 },
   footerText: { color: "rgba(255,255,255,0.55)", fontSize: 11, lineHeight: 15 },

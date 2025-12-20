@@ -5,10 +5,14 @@ import { useFocusEffect } from "@react-navigation/native";
 import { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { RoutineStackParamList } from "../navigation/RoutineStack";
-import { getRoutineItems, removeRoutineItem, clearRoutine } from "../store/routineStore";
+import { Frequency, getRoutineItems, removeRoutineItem, clearRoutine, setRoutineFrequency } from "../store/routineStore";
 import Chip from "../components/Chip";
 
 type Props = NativeStackScreenProps<RoutineStackParamList, "RoutineHome">;
+
+function nextFreq(f: Frequency): Frequency {
+  return f === "Daily" ? "Weekly" : f === "Weekly" ? "Rare" : "Daily";
+}
 
 export default function RoutineScreen({ navigation }: Props) {
   const [items, setItems] = useState(() => getRoutineItems());
@@ -32,9 +36,14 @@ export default function RoutineScreen({ navigation }: Props) {
     });
   }, [navigation]);
 
-  const goScan = () => {
-    // go to the Scan tab from inside Routine stack
-    navigation.getParent()?.navigate("Scan" as never);
+  const goScan = () => navigation.getParent()?.navigate("Scan" as never);
+
+  const openProductFromRoutine = (barcode: string) => {
+    // jump to Scan tab -> Product
+    navigation.getParent()?.navigate("Scan" as never, {
+      screen: "Product",
+      params: { barcode, initialTab: "Health" },
+    } as never);
   };
 
   return (
@@ -61,16 +70,14 @@ export default function RoutineScreen({ navigation }: Props) {
       {items.length === 0 ? (
         <View style={styles.card}>
           <Text style={styles.cardTitle}>No items yet</Text>
-          <Text style={styles.p}>
-            Scan a product and tap “Add to my Routine”. This screen is your base for the cross-additive interaction
-            feature (USP).
-          </Text>
+          <Text style={styles.p}>Scan a product and tap “Add to my Routine”.</Text>
         </View>
       ) : (
         <>
           <Text style={styles.section}>Items</Text>
+
           {items.map((it) => (
-            <View key={it.id} style={styles.itemCard}>
+            <Pressable key={it.id} style={styles.itemCard} onPress={() => openProductFromRoutine(it.barcode)}>
               <View style={{ flex: 1 }}>
                 <Text style={styles.itemTitle} numberOfLines={1}>
                   {it.name}
@@ -80,22 +87,44 @@ export default function RoutineScreen({ navigation }: Props) {
                 </Text>
 
                 <View style={styles.badges}>
-                  <Chip label={`Eco ${it.badges.eco}`} tone={it.badges.eco === "A" || it.badges.eco === "B" ? "good" : it.badges.eco === "C" ? "warn" : "bad"} />
+                  <Chip
+                    label={`Eco ${it.badges.eco}`}
+                    tone={it.badges.eco === "A" || it.badges.eco === "B" ? "good" : it.badges.eco === "C" ? "warn" : "bad"}
+                  />
                   <Chip label={`Allergens ${it.badges.allergensCount}`} tone={it.badges.allergensCount ? "warn" : "good"} />
-                  <Chip label={`Additives ${it.badges.additivesRisk}`} tone={it.badges.additivesRisk === "High" ? "bad" : it.badges.additivesRisk === "Medium" ? "warn" : "good"} />
+                  <Chip
+                    label={`Additives ${it.badges.additivesRisk}`}
+                    tone={it.badges.additivesRisk === "High" ? "bad" : it.badges.additivesRisk === "Medium" ? "warn" : "good"}
+                  />
+                </View>
+
+                <View style={{ marginTop: 10, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                  <Text style={styles.freqLabel}>Frequency</Text>
+                  <Pressable
+                    style={styles.freqPill}
+                    onPress={(e) => {
+                      e.stopPropagation();
+                      const next = nextFreq(it.frequency);
+                      setRoutineFrequency(it.id, next);
+                      refresh();
+                    }}
+                  >
+                    <Text style={styles.freqText}>{it.frequency}</Text>
+                  </Pressable>
                 </View>
               </View>
 
               <Pressable
                 style={styles.removeBtn}
-                onPress={() => {
+                onPress={(e) => {
+                  e.stopPropagation();
                   removeRoutineItem(it.id);
                   refresh();
                 }}
               >
                 <Ionicons name="trash-outline" size={18} color="white" />
               </Pressable>
-            </View>
+            </Pressable>
           ))}
 
           <Pressable
@@ -103,14 +132,7 @@ export default function RoutineScreen({ navigation }: Props) {
             onPress={() => {
               Alert.alert("Clear Routine?", "This removes all items from your routine list.", [
                 { text: "Cancel", style: "cancel" },
-                {
-                  text: "Clear",
-                  style: "destructive",
-                  onPress: () => {
-                    clearRoutine();
-                    refresh();
-                  },
-                },
+                { text: "Clear", style: "destructive", onPress: () => (clearRoutine(), refresh()) },
               ]);
             }}
           >
@@ -189,6 +211,17 @@ const styles = StyleSheet.create({
   itemSub: { marginTop: 4, color: "rgba(255,255,255,0.65)", fontWeight: "800", fontSize: 12 },
 
   badges: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 10 },
+
+  freqLabel: { color: "rgba(255,255,255,0.65)", fontWeight: "900", fontSize: 12 },
+  freqPill: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+  },
+  freqText: { color: "white", fontWeight: "900", fontSize: 12 },
 
   removeBtn: {
     width: 40,

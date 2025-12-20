@@ -3,7 +3,7 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 
 import InfoSheet from "../components/InfoSheet";
-import { getRoutineItems } from "../store/routineStore";
+import { Frequency, getRoutineItems, setRoutineFrequency } from "../store/routineStore";
 
 type Severity = "High" | "Medium" | "Low";
 
@@ -23,63 +23,107 @@ function sevTone(s: Severity) {
   return styles.badgeGood;
 }
 
+function weight(freq: Frequency) {
+  return freq === "Daily" ? 1.0 : freq === "Weekly" ? 0.6 : 0.3;
+}
+
+function nextFreq(f: Frequency): Frequency {
+  return f === "Daily" ? "Weekly" : f === "Weekly" ? "Rare" : "Daily";
+}
+
+function summarize(list: Interaction[]) {
+  const out = { High: 0, Medium: 0, Low: 0 };
+  for (const i of list) out[i.severity]++;
+  return out;
+}
+
+function makePlaceholderInteractions(items: ReturnType<typeof getRoutineItems>): Interaction[] {
+  if (items.length < 2) return [];
+
+  const a = items[0];
+  const b = items[1];
+
+  const w = (weight(a.frequency) + weight(b.frequency)) / 2;
+
+  const severity: Severity =
+    a.badges.additivesRisk === "High" || b.badges.additivesRisk === "High"
+      ? w > 0.7
+        ? "High"
+        : "Medium"
+      : a.badges.additivesRisk === "Medium" || b.badges.additivesRisk === "Medium"
+      ? w > 0.7
+        ? "Medium"
+        : "Low"
+      : "Low";
+
+  const confidence: Interaction["confidence"] = w > 0.8 ? "Medium" : w > 0.5 ? "Low" : "Low";
+
+  const base: Interaction[] = [
+    {
+      id: `pair-${a.id}-${b.id}`,
+      title: `${a.name} + ${b.name}`,
+      severity,
+      confidence,
+      why:
+        "Placeholder: risk may increase when certain additives are consumed together regularly. " +
+        "This demo uses your Routine frequency to adjust perceived exposure (Daily > Weekly > Rare).",
+      whatToDo:
+        "Placeholder: reduce frequency, swap one item, or exclude one item below and compare results.",
+      sources: [{ label: "Source placeholder", url: "https://example.com" }],
+    },
+  ];
+
+  if (items.length >= 3) {
+    const c = items[2];
+    const w3 = (weight(a.frequency) + weight(b.frequency) + weight(c.frequency)) / 3;
+    base.push({
+      id: `tri-${a.id}-${b.id}-${c.id}`,
+      title: `${a.name} + ${b.name} + ${c.name}`,
+      severity: w3 > 0.75 ? "High" : "Medium",
+      confidence: "Low",
+      why: "Placeholder: combined exposure can matter more than single-product exposure.",
+      whatToDo: "Placeholder: try excluding one item using the toggles and compare results.",
+      sources: [{ label: "Source placeholder", url: "https://example.com" }],
+    });
+  }
+
+  return base;
+}
+
 export default function InteractionCheckScreen() {
-  const items = useMemo(() => getRoutineItems(), []);
+  const [items, setItems] = useState(() => getRoutineItems());
   const [excluded, setExcluded] = useState<Record<string, boolean>>({});
   const [open, setOpen] = useState<Interaction | null>(null);
 
   const includedItems = useMemo(() => items.filter((it) => !excluded[it.id]), [items, excluded]);
+  const excludedCount = useMemo(() => Object.values(excluded).filter(Boolean).length, [excluded]);
 
-  const interactions: Interaction[] = useMemo(() => {
-    // Placeholder engine: generate a few deterministic interactions based on included items
-    if (includedItems.length < 2) return [];
+  const interactionsFull = useMemo(() => makePlaceholderInteractions(items), [items]);
+  const interactionsNow = useMemo(() => makePlaceholderInteractions(includedItems), [includedItems]);
 
-    const a = includedItems[0];
-    const b = includedItems[1];
+  const fullSum = useMemo(() => summarize(interactionsFull), [interactionsFull]);
+  const nowSum = useMemo(() => summarize(interactionsNow), [interactionsNow]);
 
-    const base: Interaction[] = [
-      {
-        id: `pair-${a.id}-${b.id}`,
-        title: `${a.name} + ${b.name}`,
-        severity: a.badges.additivesRisk === "High" || b.badges.additivesRisk === "High" ? "High" : "Medium",
-        confidence: "Low",
-        why:
-          "Placeholder: interaction risk may increase when certain additives are consumed together regularly. Later: your backend will compute real evidence + confidence.",
-        whatToDo:
-          "Placeholder: reduce frequency, swap one item for a lower-additive alternative, then re-check.",
-        sources: [{ label: "Source placeholder", url: "https://example.com" }],
-      },
-    ];
-
-    if (includedItems.length >= 3) {
-      const c = includedItems[2];
-      base.push({
-        id: `tri-${a.id}-${b.id}-${c.id}`,
-        title: `${a.name} + ${b.name} + ${c.name}`,
-        severity: "Medium",
-        confidence: "Low",
-        why: "Placeholder: combined exposure can matter more than single-product exposure.",
-        whatToDo: "Placeholder: try excluding one item using the toggles and compare results.",
-        sources: [{ label: "Source placeholder", url: "https://example.com" }],
-      });
-    }
-
-    return base;
-  }, [includedItems]);
+  const delta = useMemo(() => {
+    return {
+      High: nowSum.High - fullSum.High,
+      Medium: nowSum.Medium - fullSum.Medium,
+      Low: nowSum.Low - fullSum.Low,
+    };
+  }, [fullSum, nowSum]);
 
   const grouped = useMemo(() => {
     const g: Record<Severity, Interaction[]> = { High: [], Medium: [], Low: [] };
-    for (const it of interactions) g[it.severity].push(it);
+    for (const it of interactionsNow) g[it.severity].push(it);
     return g;
-  }, [interactions]);
+  }, [interactionsNow]);
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={{ padding: 16, paddingBottom: 26, gap: 12 }}>
       <View style={styles.card}>
         <Text style={styles.title}>Interaction Check</Text>
         <Text style={styles.p}>
-          Toggle items to run “what-if” analysis. This is where your USP lives: cross-additive interactions across a
-          user’s routine.
+          Toggle items to run “what-if” analysis. Frequency affects exposure weighting (placeholder).
         </Text>
 
         <View style={styles.row}>
@@ -102,6 +146,12 @@ export default function InteractionCheckScreen() {
             </Pressable>
           </View>
         </View>
+
+        {excludedCount > 0 ? (
+          <Text style={styles.deltaText}>
+            Compared to full routine: High {delta.High >= 0 ? "+" : ""}{delta.High}, Medium {delta.Medium >= 0 ? "+" : ""}{delta.Medium}, Low {delta.Low >= 0 ? "+" : ""}{delta.Low}
+          </Text>
+        ) : null}
       </View>
 
       <View style={styles.card}>
@@ -113,24 +163,32 @@ export default function InteractionCheckScreen() {
           items.map((it) => {
             const off = !!excluded[it.id];
             return (
-              <Pressable
-                key={it.id}
-                onPress={() => setExcluded((p) => ({ ...p, [it.id]: !p[it.id] }))}
-                style={[styles.itemRow, off ? styles.itemRowOff : null]}
-              >
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.itemTitle} numberOfLines={1}>
-                    {it.name}
-                  </Text>
+              <View key={it.id} style={[styles.itemRow, off ? styles.itemRowOff : null]}>
+                <Pressable style={{ flex: 1 }} onPress={() => setExcluded((p) => ({ ...p, [it.id]: !p[it.id] }))}>
+                  <Text style={styles.itemTitle} numberOfLines={1}>{it.name}</Text>
                   <Text style={styles.itemSub} numberOfLines={1}>
                     {it.brand} • {it.badges.additivesRisk} additives risk
                   </Text>
-                </View>
+                </Pressable>
 
-                <View style={[styles.togglePill, off ? styles.toggleOff : styles.toggleOn]}>
+                <Pressable
+                  style={styles.freqPill}
+                  onPress={() => {
+                    const next = nextFreq(it.frequency);
+                    setRoutineFrequency(it.id, next);
+                    setItems(getRoutineItems());
+                  }}
+                >
+                  <Text style={styles.freqText}>{it.frequency}</Text>
+                </Pressable>
+
+                <Pressable
+                  style={[styles.togglePill, off ? styles.toggleOff : styles.toggleOn]}
+                  onPress={() => setExcluded((p) => ({ ...p, [it.id]: !p[it.id] }))}
+                >
                   <Ionicons name={off ? "eye-off-outline" : "eye-outline"} size={16} color="white" />
-                </View>
-              </Pressable>
+                </Pressable>
+              </View>
             );
           })
         )}
@@ -141,7 +199,7 @@ export default function InteractionCheckScreen() {
 
         {includedItems.length < 2 ? (
           <Text style={styles.p}>Add at least 2 routine items (and include them) to see interaction results.</Text>
-        ) : interactions.length === 0 ? (
+        ) : interactionsNow.length === 0 ? (
           <Text style={styles.p}>No interactions detected (placeholder).</Text>
         ) : (
           <>
@@ -153,9 +211,7 @@ export default function InteractionCheckScreen() {
                   {grouped[sev].map((r) => (
                     <Pressable key={r.id} style={styles.resultRow} onPress={() => setOpen(r)}>
                       <View style={{ flex: 1 }}>
-                        <Text style={styles.resultTitle} numberOfLines={2}>
-                          {r.title}
-                        </Text>
+                        <Text style={styles.resultTitle} numberOfLines={2}>{r.title}</Text>
                         <Text style={styles.resultSub}>Confidence: {r.confidence}</Text>
                       </View>
 
@@ -215,6 +271,8 @@ const styles = StyleSheet.create({
   },
   smallBtnText: { color: "white", fontWeight: "900", fontSize: 12 },
 
+  deltaText: { marginTop: 10, color: "rgba(255,255,255,0.70)", fontWeight: "900", fontSize: 12 },
+
   itemRow: {
     marginTop: 10,
     flexDirection: "row",
@@ -229,6 +287,16 @@ const styles = StyleSheet.create({
   itemRowOff: { opacity: 0.55 },
   itemTitle: { color: "white", fontWeight: "900" },
   itemSub: { marginTop: 4, color: "rgba(255,255,255,0.65)", fontWeight: "800", fontSize: 12 },
+
+  freqPill: {
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+  },
+  freqText: { color: "white", fontWeight: "900", fontSize: 12 },
 
   togglePill: {
     width: 44,
