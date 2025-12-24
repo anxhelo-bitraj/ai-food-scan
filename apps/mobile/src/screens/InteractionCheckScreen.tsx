@@ -1,9 +1,10 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useState, useEffect } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 
 import InfoSheet from "../components/InfoSheet";
 import { Frequency, getRoutineItems, setRoutineFrequency } from "../store/routineStore";
+import { post } from "../lib/api";
 
 type Severity = "High" | "Medium" | "Low";
 
@@ -98,8 +99,101 @@ export default function InteractionCheckScreen() {
   const includedItems = useMemo(() => items.filter((it) => !excluded[it.id]), [items, excluded]);
   const excludedCount = useMemo(() => Object.values(excluded).filter(Boolean).length, [excluded]);
 
-  const interactionsFull = useMemo(() => makePlaceholderInteractions(items), [items]);
-  const interactionsNow = useMemo(() => makePlaceholderInteractions(includedItems), [includedItems]);
+  // Interactions from API (backend)
+  const [apiLoading, setApiLoading] = useState(false);
+  const [apiError, setApiError] = useState<string | null>(null);
+
+  const [interactionsFull, setInteractionsFull] = useState<any[]>([]);
+  const [interactionsNow, setInteractionsNow] = useState<any[]>([]);
+
+  // Full routine interactions (for comparison)
+  useEffect(() => {
+    let cancelled = false;
+
+    if (items.length < 2) {
+      setInteractionsFull([]);
+      return;
+    }
+
+    const t = setTimeout(async () => {
+      try {
+        const resp = await post<any>("/interactions/check", {
+          items: items.map((it: any) => it.name),
+        });
+        if (cancelled) return;
+
+        setInteractionsFull(
+          (resp?.matches ?? []).map((m: any) => ({
+            id: String(m.id),
+            title: m.title,
+            severity: m.severity,
+            confidence: m.confidence,
+            why: m.why ?? "",
+            whatToDo: m.what_to_do ?? "",
+            sources: (m.sources ?? []).map((s: any) => ({ label: s.label, url: s.url })),
+          }))
+        );
+      } catch {
+        if (!cancelled) setInteractionsFull([]);
+      }
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [items]);
+
+  // Included (what-if) interactions (this is what user is currently testing)
+  useEffect(() => {
+    let cancelled = false;
+
+    if (includedItems.length < 2) {
+      setInteractionsNow([]);
+      setApiLoading(false);
+      setApiError(null);
+      return;
+    }
+
+    const t = setTimeout(async () => {
+      try {
+        setApiLoading(true);
+        setApiError(null);
+
+        const resp = await post<any>("/interactions/check", {
+          items: includedItems.map((it: any) => it.name),
+        });
+
+        if (cancelled) return;
+
+        setInteractionsNow(
+          (resp?.matches ?? []).map((m: any) => ({
+            id: String(m.id),
+            title: m.title,
+            severity: m.severity,
+            confidence: m.confidence,
+            why: m.why ?? "",
+            whatToDo: m.what_to_do ?? "",
+            sources: (m.sources ?? []).map((s: any) => ({ label: s.label, url: s.url })),
+          }))
+        );
+      } catch (e: any) {
+        if (cancelled) return;
+        setInteractionsNow([]);
+        setApiError(e?.message ?? "Failed to reach API");
+      } finally {
+        if (!cancelled) setApiLoading(false);
+      }
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [includedItems]);
+
+    // interactionsNow is loaded from the API above
+
 
   const fullSum = useMemo(() => summarize(interactionsFull), [interactionsFull]);
   const nowSum = useMemo(() => summarize(interactionsNow), [interactionsNow]);
@@ -127,7 +221,9 @@ export default function InteractionCheckScreen() {
         </Text>
 
         <View style={styles.row}>
-          <Text style={styles.muted}>Included: {includedItems.length}/{items.length}</Text>
+          {apiLoading ? <Text style={styles.muted}>Checking interactions…</Text> : null}
+      {apiError ? <Text style={styles.error}>{apiError}</Text> : null}
+      <Text style={styles.muted}>Included: {includedItems.length}/{items.length}</Text>
 
           <View style={{ flexDirection: "row", gap: 10 }}>
             <Pressable style={styles.smallBtn} onPress={() => setExcluded({})}>
@@ -257,6 +353,7 @@ const styles = StyleSheet.create({
   title: { color: "white", fontWeight: "900", fontSize: 18 },
   cardTitle: { color: "white", fontWeight: "900" },
   p: { marginTop: 8, color: "rgba(255,255,255,0.78)", lineHeight: 18, fontSize: 13 },
+  error: { color: "#ef4444", fontSize: 12, marginTop: 8 },
   muted: { color: "#9ca3af", fontWeight: "900" },
 
   row: { marginTop: 12, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 },

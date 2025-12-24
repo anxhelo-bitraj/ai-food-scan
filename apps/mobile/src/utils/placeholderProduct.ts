@@ -100,11 +100,11 @@ export function buildPlaceholderProduct(barcode: string): PlaceholderProduct {
 }
 
 export function computeAllergensCount(p: PlaceholderProduct) {
-  return p.allergens.filter((a) => a.status !== "Not listed").length;
+  return (p.allergens ?? []).filter((a) => a.status !== "Not listed").length;
 }
 
 export function computeAdditivesRisk(p: PlaceholderProduct): "Low" | "Medium" | "High" {
-  if (p.additives.some((a) => a.level === "High")) return "High";
-  if (p.additives.some((a) => a.level === "Medium")) return "Medium";
+  if ((p.additives ?? []).some((a) => a.level === "High")) return "High";
+  if ((p.additives ?? []).some((a) => a.level === "Medium")) return "Medium";
   return "Low";
 }

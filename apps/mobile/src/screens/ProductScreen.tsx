@@ -10,6 +10,7 @@ import Chip from "../components/Chip";
 import InfoSheet from "../components/InfoSheet";
 import { upsertRoutineItem } from "../store/routineStore";
 import { getPreferences } from "../store/preferencesStore";
+import { get } from "../lib/api";
 import { buildPlaceholderProduct, computeAdditivesRisk, computeAllergensCount } from "../utils/placeholderProduct";
 
 type Props = NativeStackScreenProps<ScanStackParamList, "Product">;
@@ -21,6 +22,157 @@ function toneForEco(grade: string) {
   return "bad";
 }
 
+// API_LINK_START
+type ApiProduct = {
+  barcode?: string | null;
+  name?: string | null;
+  brand?: string | null;
+  image_url?: string | null;
+
+  ingredients_text?: string | null;
+
+  allergens?: unknown;
+  traces?: unknown;
+  additives?: unknown;
+  analysis?: unknown;
+
+  diet_flags?: { vegan?: boolean | null; vegetarian?: boolean | null } | null;
+
+  nutriscore_grade?: string | null;
+  ecoscore_grade?: string | null;
+  ecoscore_score?: number | null;
+
+  health_score?: number | null;
+};
+
+function asStringList(v: unknown): string[] {
+  if (Array.isArray(v)) return v.filter((x) => typeof x === "string") as string[];
+  if (typeof v === "string") {
+    return v
+      .split(/[,;\n•]/g)
+      .map((x) => x.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function cleanTag(s: string) {
+  return s.replace(/^en:/i, "").replace(/[_-]+/g, " ").trim();
+}
+
+function titleCase(s: string) {
+  const t = cleanTag(s);
+  return t ? t.charAt(0).toUpperCase() + t.slice(1) : t;
+}
+
+function toYesNo(v: boolean | null | undefined): "Yes" | "No" | "Unknown" {
+  if (v === true) return "Yes";
+  if (v === false) return "No";
+  return "Unknown";
+}
+
+function normalizeEcoGrade(raw: unknown): string {
+  if (typeof raw !== "string" || !raw.trim()) return "—";
+  const g = raw.trim().toUpperCase();
+  if (g === "NOT-APPLICABLE") return "NA";
+  if (["A", "B", "C", "D", "E"].includes(g)) return g;
+  return g; // fallback (won't crash)
+}
+
+function ecoSummaryFrom(grade: string, score: number | null): string {
+  if (!grade || grade == "—") return "No Eco-Score data available for this product.";
+  if (grade === "NA") return "Eco-Score is not applicable for this product category.";
+  if (typeof score === "number") return `Eco-Score grade ${grade} (score ${score}).`;
+  return `Eco-Score grade ${grade}.`;
+}
+
+function healthScoreFrom(api: any, fallback: number): number {
+  if (typeof api?.health_score === "number") return api.health_score;
+  const ng = (typeof api?.nutriscore_grade === "string" ? api.nutriscore_grade : "").trim().toUpperCase();
+  const map: Record<string, number> = { A: 90, B: 75, C: 60, D: 40, E: 20 };
+  return map[ng] ?? fallback ?? 0;
+}
+
+function allergenListed(name: string, apiAllergens: string[]) {
+  const n = name.toLowerCase();
+  return apiAllergens.some((a) => {
+    const x = cleanTag(a).toLowerCase();
+    if (!x) return false;
+    if (x.includes(n) || n.includes(x)) return true;
+
+    // common equivalences:
+    if ((n === "dairy" || n === "milk") && (x.includes("milk") || x.includes("dairy"))) return true;
+    if (n === "nuts" && (x.includes("nuts") || x.includes("peanut") || x.includes("tree nut"))) return true;
+    if (n === "gluten" && (x.includes("gluten") || x.includes("wheat") || x.includes("barley") || x.includes("rye")))
+      return true;
+
+    return false;
+  });
+}
+// NOTE: the above uses Python-like 'or/and/True/False' placeholders; we will replace it with valid TS below.
+function mergeApiIntoPlaceholder(base: any, api: ApiProduct | any) {
+  const out: any = { ...base };
+
+  const b = String(api?.barcode ?? api?.code ?? out.barcode ?? "").trim();
+  if (b) out.barcode = b;
+
+  const name = typeof api?.name === "string" ? api.name : (typeof api?.product_name === "string" ? api.product_name : null);
+  if (name && name.trim()) out.name = name.trim();
+
+  const brand = typeof api?.brand === "string" ? api.brand : (typeof api?.brands === "string" ? api.brands : null);
+  if (brand && brand.trim()) out.brand = brand.trim();
+
+  const ecoGrade = normalizeEcoGrade(api?.ecoscore_grade);
+  const ecoScore = typeof api?.ecoscore_score === "number" ? api.ecoscore_score : null;
+
+  out.eco = out.eco ?? {};
+  out.eco.grade = ecoGrade;
+  out.eco.summary = ecoSummaryFrom(ecoGrade, ecoScore);
+
+  out.vegan = toYesNo(api?.diet_flags?.vegan);
+  out.vegetarian = toYesNo(api?.diet_flags?.vegetarian);
+
+  // healthScore must remain a number (UI uses it for progress bar)
+  out.healthScore = healthScoreFrom(api, typeof out.healthScore === "number" ? out.healthScore : 60);
+
+  // additives: backend returns string[] like ["E102","E211"] => UI expects objects with code/name/level
+  const apiAdditives = asStringList(api?.additives).map((x) => x.trim()).filter(Boolean);
+  out.additives = apiAdditives.map((code) => {
+    const c = code.toUpperCase();
+    return { code: c, name: c, level: "Unknown" };
+  });
+
+  // allergens: backend returns string[]; UI expects [{name,status}]
+  const apiAllergens = asStringList(api?.allergens).map((x) => x.trim()).filter(Boolean);
+
+  if (Array.isArray(out.allergens) && out.allergens.length && typeof out.allergens[0] === "object") {
+    // keep the existing allergen rows in UI, only update statuses
+    out.allergens = out.allergens.map((a: any) => {
+      const nm = typeof a?.name === "string" ? a.name : "";
+      return { ...a, status: nm && allergenListed(nm, apiAllergens) ? "Listed" : "Not listed" };
+    });
+
+    // add any extra allergens not already present in base list
+    const baseNames = new Set(out.allergens.map((a: any) => String(a?.name ?? "").toLowerCase()));
+    for (const raw of apiAllergens) {
+      const pretty = titleCase(raw);
+      if (pretty && !baseNames.has(pretty.toLowerCase())) {
+        out.allergens.push({ name: pretty, status: "Listed" });
+      }
+    }
+  } else {
+    out.allergens = apiAllergens.map((x) => ({ name: titleCase(x), status: "Listed" }));
+  }
+
+  // keep sources stable (InfoSheet expects it)
+  out.sources = Array.isArray(out.sources) ? out.sources : [];
+
+  return out;
+}
+
+// API_LINK_END
+
+
 export default function ProductScreen({ route, navigation }: Props) {
   const { barcode } = route.params;
   const initialTab = (route.params?.initialTab as TabKey | undefined) ?? "Health";
@@ -31,12 +183,39 @@ export default function ProductScreen({ route, navigation }: Props) {
   // Skeleton loading (UI only)
   const [loading, setLoading] = useState(true);
   useEffect(() => {
+    let cancelled = false;
+    let t: any = null;
+    const started = Date.now();
+  
     setLoading(true);
-    const t = setTimeout(() => setLoading(false), 220);
-    return () => clearTimeout(t);
+    // always start from the placeholder shape so the UI never breaks
+    const base = buildPlaceholderProduct(barcode);
+    setProduct(base);
+  
+    (async () => {
+      try {
+        const raw: any = await get<any>("/products/" + encodeURIComponent(barcode));
+        const api: any = raw?.product ?? raw?.data ?? raw;
+        if (cancelled) return;
+        setProduct(mergeApiIntoPlaceholder(base, api));
+      } catch (e: any) {
+        // keep placeholder if API fails (no UI/layout change)
+        console.warn("Product fetch failed:", e?.message ?? e);
+      } finally {
+        const ms = Date.now() - started;
+        const wait = ms < 220 ? 220 - ms : 0;
+        t = setTimeout(() => {
+          if (!cancelled) setLoading(false);
+        }, wait);
+      }
+    })();
+  
+    return () => {
+      cancelled = true;
+      if (t) clearTimeout(t);
+    };
   }, [barcode]);
-
-  const product = useMemo(() => buildPlaceholderProduct(barcode), [barcode]);
+  const [product, setProduct] = useState(() => buildPlaceholderProduct(barcode));
   const prefs = useMemo(() => getPreferences(), []);
 
   useEffect(() => {
