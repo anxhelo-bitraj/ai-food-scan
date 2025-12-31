@@ -136,5 +136,7 @@ const styles = StyleSheet.create({
     borderColor: "rgba(255,255,255,0.10)",
   },
   sourceText: { color: "rgba(255,255,255,0.86)", fontWeight: "800", fontSize: 12, flex: 1 },
+  linkText: { color: "rgba(255,255,255,0.86)", fontWeight: "800", fontSize: 12 },
+
   foot: { marginTop: 10, color: "rgba(255,255,255,0.55)", fontSize: 11, lineHeight: 15 },
 });
