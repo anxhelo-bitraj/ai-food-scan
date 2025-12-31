@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgres:16
+    container_name: ai_food_scan_db
+    environment:
+      POSTGRES_USER: food
+      POSTGRES_PASSWORD: food
+      POSTGRES_DB: foodscan
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

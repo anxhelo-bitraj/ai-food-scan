@@ -1,0 +1,833 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Alert,
+  Animated,
+  Image,
+  Linking,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { Ionicons } from "@expo/vector-icons";
+import * as Haptics from "expo-haptics";
+import { NativeStackScreenProps } from "@react-navigation/native-stack";
+
+import { ScanStackParamList } from "../navigation/ScanStack";
+import Chip from "../components/Chip";
+import InfoSheet, { SheetSource } from "../components/InfoSheet";
+import { get, postJson } from "../lib/api";
+import { upsertRoutineItem } from "../store/routineStore";
+
+type Props = NativeStackScreenProps<ScanStackParamList, "Product">;
+
+type TabKey = "Health" | "Additives" | "Allergens" | "Diet" | "Eco";
+
+type ApiProduct = {
+  barcode?: string | null;
+  name?: string | null;
+  brand?: string | null;
+  image_url?: string | null;
+  ingredients_text?: string | null;
+
+  allergens?: any;
+  traces?: any;
+  additives?: any;
+  analysis?: any;
+  diet_flags?: { vegan?: boolean | null; vegetarian?: boolean | null } | null;
+
+  nutriscore_grade?: string | null;
+  ecoscore_grade?: string | null;
+  ecoscore_score?: number | null;
+
+  health_score?: number | null;     // optional future
+  additive_score?: number | null;   // your backend returns this
+
+  off?: any; // OFF summary block you added
+};
+
+type AdditiveRow = {
+  code: string;
+  name: string;
+  level: "High" | "Medium" | "Low" | "Unknown";
+};
+
+function asStringList(v: unknown): string[] {
+  if (Array.isArray(v)) return v.filter((x) => typeof x === "string") as string[];
+  if (typeof v === "string") {
+    return v
+      .split(/[,;\n•]/g)
+      .map((x) => x.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function titleCase(s: string) {
+  const t = String(s || "").trim();
+  if (!t) return "";
+  return t
+    .split(/[\s\-_]+/g)
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : ""))
+    .join(" ");
+}
+
+function toneForEco(gradeRaw: any) {
+  const g = String(gradeRaw ?? "").trim().toUpperCase();
+  if (g === "A" || g === "B") return "good";
+  if (g === "C") return "warn";
+  if (!g || g === "—" || g === "NA" || g === "NOT-APPLICABLE") return "neutral";
+  return "bad";
+}
+
+function toYesNo(v: any) {
+  if (v === true) return "Yes";
+  if (v === false) return "No";
+  return "Unknown";
+}
+
+function placeholder(barcode: string) {
+  return {
+    barcode,
+    name: "Loading…",
+    brand: "",
+    image_url: "",
+    ingredients_text: "",
+    allergens: [] as string[],
+    traces: [] as string[],
+    additives: [] as AdditiveRow[],
+    analysis: [] as string[],
+    diet_flags: { vegan: null, vegetarian: null },
+    vegan: "Unknown",
+    vegetarian: "Unknown",
+    nutriscore_grade: "—",
+    ecoscore_grade: "—",
+    ecoscore_score: null as number | null,
+    additive_score: null as number | null,
+    score: 60, // UI uses a number always
+    off: null as any,
+  };
+}
+
+function scoreFrom(api: ApiProduct | any, fallback: number) {
+  if (typeof api?.health_score === "number") return api.health_score;
+  if (typeof api?.additive_score === "number") return api.additive_score;
+  const ng = String(api?.nutriscore_grade ?? "").trim().toUpperCase();
+  const map: Record<string, number> = { A: 90, B: 75, C: 60, D: 40, E: 20 };
+  return map[ng] ?? fallback;
+}
+
+function NutriBar({
+  label,
+  value,
+  unit,
+  max,
+  hint,
+}: {
+  label: string;
+  value: number | null;
+  unit: string;
+  max: number;
+  hint?: string;
+}) {
+  const pct = value == null || !isFinite(value) ? 0 : Math.max(0, Math.min(1, value / max));
+  const w = `${Math.round(pct * 100)}%`;
+  return (
+    <View style={{ gap: 6 }}>
+      <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+        <Text style={styles.rowLabel}>{label}</Text>
+        <Text style={styles.rowValue}>{value == null ? "—" : `${value}${unit}`}</Text>
+      </View>
+      <View style={styles.barTrack}>
+        <View style={[styles.barFill, { width: w }]} />
+      </View>
+      {hint ? <Text style={styles.mini}>{hint}</Text> : null}
+    </View>
+  );
+}
+
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.row}>
+      <Text style={styles.rowLabel}>{label}</Text>
+      <Text style={styles.rowValue} numberOfLines={1}>
+        {value}
+      </Text>
+    </View>
+  );
+}
+
+function Card({
+  title,
+  children,
+  right,
+}: {
+  title: string;
+  children: React.ReactNode;
+  right?: React.ReactNode;
+}) {
+  return (
+    <View style={styles.card}>
+      <View style={styles.cardHead}>
+        <Text style={styles.cardTitle}>{title}</Text>
+        {right ? <View>{right}</View> : null}
+      </View>
+      <View style={{ marginTop: 10 }}>{children}</View>
+    </View>
+  );
+}
+
+export default function ProductScreen({ route, navigation }: Props) {
+  const barcode = String((route.params as any)?.barcode ?? "").trim();
+
+  const [tab, setTab] = useState<TabKey>("Health");
+  const [loading, setLoading] = useState(true);
+
+  const [product, setProduct] = useState<any>(() => placeholder(barcode));
+
+  const [sheet, setSheet] = useState<{ title: string; body: string; sources?: SheetSource[] } | null>(null);
+
+  const scoreAnim = useRef(new Animated.Value(0)).current;
+
+  const [showNutrition, setShowNutrition] = useState(false);
+
+  const ecoGrade = String(product?.off?.ecoscore_grade ?? product?.ecoscore_grade ?? "—");
+  const allergensCount = Array.isArray(product?.allergens) ? product.allergens.length : 0;
+  const additivesCount = Array.isArray(product?.additives) ? product.additives.length : 0;
+
+  const additivesRisk = useMemo(() => {
+    const arr: AdditiveRow[] = Array.isArray(product?.additives) ? product.additives : [];
+    const high = arr.filter((a) => a.level === "High").length;
+    const med = arr.filter((a) => a.level === "Medium").length;
+    if (high) return "High";
+    if (med) return "Medium";
+    if (!arr.length) return "—";
+    return "Low/Unknown";
+  }, [product?.additives]);
+
+  useEffect(() => {
+    Animated.timing(scoreAnim, {
+      toValue: loading ? 0 : Math.max(0, Math.min(1, Number(product?.score ?? 0) / 100)),
+      duration: 380,
+      useNativeDriver: false,
+    }).start();
+  }, [loading, product?.score, scoreAnim]);
+
+  const scoreWidth = scoreAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: ["0%", "100%"],
+  });
+
+  function setTabWithHaptic(k: TabKey) {
+    setTab(k);
+    Haptics.selectionAsync().catch(() => {});
+  }
+
+  async function openUrl(url: string) {
+    try {
+      await Linking.openURL(url);
+    } catch {
+      Alert.alert("Could not open link", url);
+    }
+  }
+
+  async function fetchAdditivesBatch(codes: string[]) {
+    if (!codes.length) return { rows: [] as AdditiveRow[], score: null as any };
+
+    // backend expects ["E150D","E338"] etc
+    const res: any = await postJson("/additives/batch", { e_numbers: codes });
+
+    const rows: AdditiveRow[] = (Array.isArray(res?.additives) ? res.additives : []).map((x: any) => {
+      const code = String(x?.e_number ?? "").trim().toUpperCase();
+      const name = String(x?.name ?? code).trim() || code;
+      const rl = String(x?.risk_level ?? "").toLowerCase();
+      const level =
+        rl === "high" ? "High" : rl === "medium" ? "Medium" : rl === "low" ? "Low" : "Unknown";
+      return { code, name, level };
+    });
+
+    return { rows, score: res?.score ?? null };
+  }
+
+  async function loadProduct() {
+    setLoading(true);
+    const base = placeholder(barcode);
+    setProduct(base);
+
+    try {
+      const raw: any = await get(`/products/${encodeURIComponent(barcode)}?include_off=true`);
+      const api: ApiProduct = (raw?.product ?? raw?.data ?? raw) as any;
+
+      // merge core fields
+      const merged: any = { ...base };
+      merged.barcode = String(api?.barcode ?? barcode).trim() || barcode;
+      merged.name = String(api?.name ?? merged.name ?? "").trim() || merged.name;
+      merged.brand = String(api?.brand ?? "").trim();
+      merged.image_url = String(api?.image_url ?? "").trim();
+      merged.ingredients_text = api?.ingredients_text ?? "";
+      merged.allergens = asStringList(api?.allergens);
+      merged.traces = asStringList(api?.traces);
+
+      const codes = asStringList(api?.additives).map((x) => x.trim().toUpperCase()).filter(Boolean);
+      merged.additives = codes.map((c) => ({ code: c, name: c, level: "Unknown" as const }));
+
+      merged.analysis = Array.isArray(api?.analysis) ? api.analysis : [];
+      merged.diet_flags = api?.diet_flags ?? { vegan: null, vegetarian: null };
+      merged.vegan = toYesNo(merged.diet_flags?.vegan);
+      merged.vegetarian = toYesNo(merged.diet_flags?.vegetarian);
+
+      merged.nutriscore_grade = api?.nutriscore_grade ?? "—";
+      merged.ecoscore_grade = api?.ecoscore_grade ?? "—";
+      merged.ecoscore_score = typeof api?.ecoscore_score === "number" ? api.ecoscore_score : null;
+
+      merged.additive_score = typeof api?.additive_score === "number" ? api.additive_score : null;
+
+      merged.off = api?.off ?? null;
+
+      merged.score = scoreFrom(api, 60);
+
+      // fetch additive names + risk + batch score (fast)
+      try {
+        const { rows, score } = await fetchAdditivesBatch(codes);
+        if (rows.length) merged.additives = rows;
+
+        // If backend gave a batch score, it’s the best “additives score”
+        if (typeof score?.score === "number") merged.score = score.score;
+      } catch (e) {
+        console.warn("[ProductScreen] additives batch failed:", (e as any)?.message ?? e);
+      }
+
+      setProduct(merged);
+    } catch (e: any) {
+      console.warn("Product fetch failed:", e?.message ?? e);
+      // keep placeholder
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!barcode) return;
+    loadProduct();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [barcode]);
+
+  function addToRoutine() {
+    try {
+      upsertRoutineItem({
+        barcode: String(product?.barcode ?? barcode),
+        name: String(product?.name ?? ""),
+        brand: String(product?.brand ?? ""),
+        image_url: String(product?.image_url ?? ""),
+      } as any);
+      Alert.alert("Added to Routine", "Saved.");
+    } catch {
+      Alert.alert("Could not save", "Routine storage not ready.");
+    }
+  }
+
+  async function openAdditiveDetails(a: AdditiveRow) {
+    const code = String(a?.code ?? "").trim().toUpperCase();
+    if (!code) return;
+
+    const name = String(a?.name ?? code).trim();
+    const risk = String(a?.level ?? "Unknown");
+
+    setSheet({
+      title: `${code} • ${name}`,
+      body: "Loading evidence and sources…",
+      sources: [],
+    });
+
+    try {
+      const detail: any = await get(`/additives/${encodeURIComponent(code)}`);
+      const additive = detail?.additive ?? detail ?? {};
+
+      const sourceTitle = String(additive?.source_title ?? detail?.source_title ?? "").trim();
+      const sourceUrl = String(additive?.source_url ?? detail?.source_url ?? "").trim();
+      const sourceDate = String(additive?.source_date ?? detail?.source_date ?? "").trim();
+
+      const func = String(additive?.functional_class ?? detail?.functional_class ?? "").trim();
+      const adi = additive?.adi ?? detail?.adi ?? null;
+      const note = String(additive?.note ?? detail?.note ?? "").trim();
+
+      const effects = Array.isArray(detail?.effects)
+        ? detail.effects
+        : Array.isArray(additive?.effects)
+        ? additive.effects
+        : [];
+
+      const groups = (x: any): string | null => {
+        const s = String(x ?? "").trim();
+        if (!s || s === "no-group") return null;
+        return s.split(",").map((t) => t.trim()).filter(Boolean).join(", ");
+      };
+
+      const mean = groups(additive?.exposure_mean_gt_adi ?? detail?.exposure_mean_gt_adi);
+      const p95 = groups(additive?.exposure_p95_gt_adi ?? detail?.exposure_p95_gt_adi);
+
+      const fsaSlug = "e-" + code.slice(1).toLowerCase();
+      const fsaUrl = `https://data.food.gov.uk/regulated-products/food_authorisations/${fsaSlug}`;
+      const fsaListUrl = "https://www.food.gov.uk/business-guidance/approved-additives-and-e-numbers";
+      const offAddUrl = `https://world.openfoodfacts.org/additive/en:${code.toLowerCase()}`;
+
+      const mkEffects = () => {
+        if (!effects.length) return null;
+        const pick = effects.slice(0, 8).map((x: any) => {
+          const endpoint = String(x?.endpoint ?? "").trim();
+          const effect = String(x?.effect ?? "").trim();
+          const species = String(x?.species ?? "").trim();
+          const year = x?.year ? String(x.year) : "";
+          const parts = [
+            endpoint ? `(${endpoint})` : null,
+            effect || null,
+            species ? `[${species}]` : null,
+            year || null,
+          ].filter(Boolean);
+          return "• " + parts.join(" ");
+        });
+        return pick.join("\n");
+      };
+
+      const exposureLine =
+        mean || p95
+          ? `Exposure above guidance levels reported for: ${[
+              mean ? "mean: " + mean : null,
+              p95 ? "P95: " + p95 : null,
+            ]
+              .filter(Boolean)
+              .join(" • ")}`
+          : null;
+
+      const effectsText = mkEffects();
+
+      const body =
+        `Risk level: ${risk}\n` +
+        (func ? `Functional class: ${func}\n` : "") +
+        (adi ? `ADI: ${adi}\n` : "") +
+        `\nWhat we know so far:\n` +
+        (effectsText ? `${effectsText}\n\n` : "") +
+        (exposureLine ? `${exposureLine}\n\n` : "") +
+        (!effectsText && !exposureLine ? `${note || "No structured effect rows in our DB yet. Use sources below for full context."}\n\n` : "") +
+        `Sources:\n` +
+        `• UK FSA register\n` +
+        `• Open Food Facts additive page\n` +
+        (sourceUrl ? `• ${sourceTitle || "EFSA/Scientific source"}${sourceDate ? " (" + sourceDate + ")" : ""}\n` : "") +
+        `• UK FSA approved additives list\n\n` +
+        `Note: Not medical advice. Check labels and consult professionals.`;
+
+      const sources: SheetSource[] = [];
+      if (sourceUrl) sources.push({ label: sourceTitle || "EFSA/Scientific source", url: sourceUrl });
+      sources.push({ label: "UK FSA register", url: fsaUrl });
+      sources.push({ label: "Open Food Facts additive page", url: offAddUrl });
+      sources.push({ label: "UK FSA approved additives list", url: fsaListUrl });
+
+      setSheet({ title: `${code} • ${name}`, body, sources });
+    } catch (e: any) {
+      setSheet({
+        title: `${code} • ${name}`,
+        body: `Could not load additive details.\n\nError: ${String(e?.message ?? e)}`,
+        sources: [],
+      });
+    }
+  }
+
+  const offProductUrl = useMemo(() => {
+    const b = encodeURIComponent(String(product?.barcode ?? barcode).trim());
+    return b ? `https://world.openfoodfacts.org/product/${b}` : null;
+  }, [barcode, product?.barcode]);
+
+  const n = product?.off?.nutriments ?? {};
+  const perRaw = String(product?.off?.nutrition_data_per ?? "100g").trim();
+  const perLabel = perRaw === "100g" ? "per 100 g/ml" : `per ${perRaw}`;
+
+  const energyKcal = typeof n["energy-kcal_100g"] === "number" ? n["energy-kcal_100g"] : typeof n["energy-kcal"] === "number" ? n["energy-kcal"] : null;
+  const sugar = typeof n["sugars_100g"] === "number" ? n["sugars_100g"] : null;
+  const sat = typeof n["saturated-fat_100g"] === "number" ? n["saturated-fat_100g"] : typeof n["saturated-fat"] === "number" ? n["saturated-fat"] : null;
+  const salt = typeof n["salt_100g"] === "number" ? n["salt_100g"] : null;
+
+  return (
+    <SafeAreaView style={styles.safe}>
+      <InfoSheet
+        visible={!!sheet}
+        title={sheet?.title ?? ""}
+        body={sheet?.body ?? ""}
+        sources={sheet?.sources ?? []}
+        onClose={() => setSheet(null)}
+      />
+
+      <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 28 }}>
+        {/* Header */}
+        <View style={styles.hero}>
+          <Pressable style={styles.backBtn} onPress={() => navigation.goBack()}>
+            <Ionicons name="chevron-back" size={18} color="white" />
+          </Pressable>
+
+          <View style={styles.heroRow}>
+            <View style={styles.imageWrap}>
+              {product?.image_url ? (
+                <Image source={{ uri: product.image_url }} style={styles.image} />
+              ) : (
+                <View style={styles.imagePlaceholder}>
+                  <Ionicons name="image-outline" size={18} color="rgba(255,255,255,0.5)" />
+                </View>
+              )}
+            </View>
+
+            <View style={{ flex: 1, paddingLeft: 12 }}>
+              <Text style={styles.title} numberOfLines={1}>
+                {loading ? "Loading…" : String(product?.name ?? "")}
+              </Text>
+              <Text style={styles.subtitle} numberOfLines={1}>
+                {loading ? " " : `${String(product?.brand ?? "")} • ${String(product?.barcode ?? "")}`}
+              </Text>
+            </View>
+
+            <View style={styles.scorePill}>
+              <Text style={styles.scoreLabel}>Score</Text>
+              <Text style={styles.scoreValue}>{loading ? "…" : String(product?.score ?? "—")}</Text>
+            </View>
+          </View>
+
+          <View style={styles.chipsRow}>
+            <Chip
+              label={loading ? "Eco …" : `Eco ${ecoGrade}`}
+              tone={toneForEco(ecoGrade) as any}
+            />
+            <Chip
+              label={loading ? "Vegan …" : `Vegan: ${String(product?.vegan ?? "Unknown")}`}
+              tone={product?.vegan === "Yes" ? "good" : product?.vegan === "No" ? "bad" : "neutral"}
+            />
+            <Chip
+              label={loading ? "Veg …" : `Veg: ${String(product?.vegetarian ?? "Unknown")}`}
+              tone={product?.vegetarian === "Yes" ? "good" : product?.vegetarian === "No" ? "bad" : "neutral"}
+            />
+            <Chip
+              label={loading ? "Allergens …" : `Allergens: ${allergensCount}`}
+              tone={allergensCount ? "warn" : "good"}
+            />
+            <Chip
+              label={loading ? "Additives …" : `Additives: ${additivesCount}`}
+              tone={additivesRisk === "High" ? "bad" : additivesRisk === "Medium" ? "warn" : "good"}
+            />
+          </View>
+
+          <Pressable style={styles.primaryBtn} onPress={addToRoutine} disabled={loading}>
+            <Ionicons name="add-circle-outline" size={18} color="white" />
+            <Text style={styles.primaryText}>Add to my Routine</Text>
+          </Pressable>
+
+          {offProductUrl ? (
+            <Pressable style={styles.cta} onPress={() => openUrl(offProductUrl)}>
+              <Ionicons name="link-outline" size={18} color="rgba(255,255,255,0.9)" />
+              <Text style={styles.ctaText}>Open on OpenFoodFacts</Text>
+            </Pressable>
+          ) : null}
+
+          <View style={styles.tabs}>
+            {(["Health", "Additives", "Allergens", "Diet", "Eco"] as TabKey[]).map((k) => {
+              const active = tab === k;
+              return (
+                <Pressable
+                  key={k}
+                  onPress={() => setTabWithHaptic(k)}
+                  style={[styles.tab, active ? styles.tabActive : null]}
+                >
+                  <Text style={[styles.tabText, active ? styles.tabTextActive : null]}>{k}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        </View>
+
+        {/* Content */}
+        <View style={{ paddingHorizontal: 16, paddingTop: 14, gap: 12 }}>
+          {tab === "Health" ? (
+            <>
+              <Card title="Overview (v1)">
+                <Text style={styles.p}>
+                  This is currently an **additives score** (from your backend) + OFF nutrition summary. Later you’ll combine nutrition + additives + eco + user profile.
+                </Text>
+
+                <View style={styles.progressTrack}>
+                  <Animated.View style={[styles.progressFill, { width: scoreWidth }]} />
+                </View>
+
+                <Row label="Additives score" value={loading ? "…" : `${String(product?.score ?? "—")}/100`} />
+                <Row label="Additives risk" value={loading ? "…" : String(additivesRisk)} />
+                <Row label="Nutri-Score" value={loading ? "…" : String((product?.off?.nutriscore_grade ?? product?.nutriscore_grade ?? "—")).toUpperCase()} />
+                <Row label="NOVA" value={loading ? "…" : String(product?.off?.nova_group ?? "—")} />
+                <Row label="Serving size" value={loading ? "…" : String(product?.off?.serving_size ?? "—")} />
+              </Card>
+
+              {product?.off ? (
+                <Card
+                  title={`Nutrition (${perLabel})`}
+                  right={
+                    <Pressable onPress={() => setShowNutrition((s) => !s)} style={styles.dropBtn}>
+                      <Text style={styles.dropBtnText}>{showNutrition ? "Hide" : "Show"}</Text>
+                      <Ionicons name={showNutrition ? "chevron-up" : "chevron-down"} size={16} color="rgba(255,255,255,0.8)" />
+                    </Pressable>
+                  }
+                >
+                  {showNutrition ? (
+                    <View style={{ marginTop: 6, gap: 14 }}>
+                      <NutriBar label="Energy" value={energyKcal} unit=" kcal" max={200} hint="Approx scale (per 100g/ml)" />
+                      <NutriBar label="Sugar" value={sugar} unit=" g" max={20} hint="Approx scale (per 100g/ml)" />
+                      <NutriBar label="Saturates" value={sat} unit=" g" max={10} hint="Approx scale (per 100g/ml)" />
+                      <NutriBar label="Salt" value={salt} unit=" g" max={3} hint="Approx scale (per 100g/ml)" />
+                    </View>
+                  ) : (
+                    <Text style={styles.p}>Tap “Show” to view nutrition bars.</Text>
+                  )}
+                </Card>
+              ) : null}
+            </>
+          ) : null}
+
+          {tab === "Additives" ? (
+            <Card title="Additives found">
+              {loading ? <Text style={styles.p}>Loading…</Text> : null}
+
+              {!loading && Array.isArray(product?.additives) && product.additives.length ? (
+                <View style={{ marginTop: 6, gap: 10 }}>
+                  {product.additives.map((a: AdditiveRow) => (
+                    <View key={a.code} style={styles.listRow}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.rowTitle}>
+                          {a.code} • {a.name}
+                        </Text>
+                        <Text style={styles.rowSub}>Risk: {a.level}</Text>
+                      </View>
+
+                      <Pressable
+                        style={[
+                          styles.badge,
+                          a.level === "High" ? styles.badgeBad : a.level === "Medium" ? styles.badgeWarn : styles.badgeGood,
+                        ]}
+                        onPress={() => openAdditiveDetails(a)}
+                      >
+                        <Text style={styles.badgeText}>More</Text>
+                      </Pressable>
+                    </View>
+                  ))}
+                </View>
+              ) : !loading ? (
+                <Text style={styles.p}>No additives detected.</Text>
+              ) : null}
+            </Card>
+          ) : null}
+
+          {tab === "Allergens" ? (
+            <Card title="Allergens">
+              <Row label="Listed allergens" value={allergensCount ? product.allergens.join(", ") : "None listed"} />
+              <Row label="Traces" value={Array.isArray(product?.traces) && product.traces.length ? product.traces.join(", ") : "No traces listed"} />
+            </Card>
+          ) : null}
+
+          {tab === "Diet" ? (
+            <Card title="Diet compatibility">
+              <Row label="Vegan" value={String(product?.vegan ?? "Unknown")} />
+              <Row label="Vegetarian" value={String(product?.vegetarian ?? "Unknown")} />
+              <Text style={[styles.p, { marginTop: 10 }]}>
+                Note: OFF diet flags often come as “maybe” in analysis; your backend currently returns nulls for strict vegan/vegetarian.
+              </Text>
+            </Card>
+          ) : null}
+
+          {tab === "Eco" ? (
+            <Card title="Environmental impact">
+              <Row label="Eco grade" value={String(product?.off?.ecoscore_grade ?? product?.ecoscore_grade ?? "—")} />
+              <Row label="Eco score" value={product?.off?.ecoscore_data?.score != null ? String(product.off.ecoscore_data.score) : String(product?.ecoscore_score ?? "—")} />
+              <Text style={[styles.p, { marginTop: 10 }]}>
+                Eco-Score can be “not-applicable” for some categories (like many drinks). We still show OFF data when available.
+              </Text>
+            </Card>
+          ) : null}
+
+          <Text style={styles.foot}>
+            Disclaimer: This app is informational. Not medical advice. Always check product labels and consult professionals.
+          </Text>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: "#070a0f" },
+
+  hero: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 14 },
+  backBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 999,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.08)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+    marginBottom: 12,
+  },
+
+  heroRow: { flexDirection: "row", alignItems: "center" },
+
+  imageWrap: {
+    width: 64,
+    height: 64,
+    borderRadius: 16,
+    overflow: "hidden",
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  image: { width: 64, height: 64 },
+  imagePlaceholder: { flex: 1, alignItems: "center", justifyContent: "center" },
+
+  title: { color: "white", fontSize: 18, fontWeight: "900" },
+  subtitle: { color: "rgba(255,255,255,0.65)", fontSize: 12, marginTop: 2 },
+
+  scorePill: {
+    marginLeft: 10,
+    width: 72,
+    height: 64,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  scoreLabel: { color: "rgba(255,255,255,0.6)", fontSize: 10, fontWeight: "900" },
+  scoreValue: { color: "white", fontSize: 20, fontWeight: "900", marginTop: 2 },
+
+  chipsRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 12 },
+
+  primaryBtn: {
+    marginTop: 12,
+    height: 44,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    flexDirection: "row",
+    backgroundColor: "rgba(99,102,241,0.85)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+  },
+  primaryText: { color: "white", fontWeight: "900" },
+
+  cta: {
+    marginTop: 10,
+    height: 44,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    flexDirection: "row",
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+  },
+  ctaText: { color: "rgba(255,255,255,0.92)", fontWeight: "900" },
+
+  tabs: {
+    marginTop: 14,
+    flexDirection: "row",
+    gap: 8,
+  },
+  tab: {
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  tabActive: {
+    backgroundColor: "rgba(255,255,255,0.14)",
+    borderColor: "rgba(255,255,255,0.16)",
+  },
+  tabText: { color: "rgba(255,255,255,0.70)", fontWeight: "900", fontSize: 12 },
+  tabTextActive: { color: "white" },
+
+  card: {
+    backgroundColor: "rgba(255,255,255,0.04)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+    borderRadius: 18,
+    padding: 14,
+  },
+  cardHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  cardTitle: { color: "white", fontWeight: "900", fontSize: 14 },
+
+  p: { color: "rgba(255,255,255,0.75)", lineHeight: 18, fontSize: 13 },
+
+  progressTrack: {
+    height: 10,
+    borderRadius: 999,
+    overflow: "hidden",
+    marginTop: 10,
+    backgroundColor: "rgba(255,255,255,0.10)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  progressFill: { height: "100%", backgroundColor: "rgba(99,102,241,0.9)" },
+
+  row: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 10, gap: 12 },
+  rowLabel: { color: "rgba(255,255,255,0.70)", fontWeight: "800", fontSize: 12, flex: 1 },
+  rowValue: { color: "rgba(255,255,255,0.92)", fontWeight: "900", fontSize: 12, maxWidth: "55%" },
+
+  listRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    padding: 12,
+    borderRadius: 16,
+    backgroundColor: "rgba(255,255,255,0.05)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  rowTitle: { color: "white", fontWeight: "900", fontSize: 13 },
+  rowSub: { color: "rgba(255,255,255,0.65)", fontSize: 12, marginTop: 2 },
+
+  badge: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  badgeGood: { backgroundColor: "rgba(34,197,94,0.15)", borderColor: "rgba(34,197,94,0.30)" },
+  badgeWarn: { backgroundColor: "rgba(245,158,11,0.15)", borderColor: "rgba(245,158,11,0.30)" },
+  badgeBad: { backgroundColor: "rgba(239,68,68,0.15)", borderColor: "rgba(239,68,68,0.30)" },
+  badgeText: { color: "white", fontWeight: "900", fontSize: 12 },
+
+  barTrack: {
+    height: 10,
+    borderRadius: 999,
+    overflow: "hidden",
+    backgroundColor: "rgba(255,255,255,0.10)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  barFill: { height: "100%", backgroundColor: "rgba(255,255,255,0.55)" },
+
+  mini: { color: "rgba(255,255,255,0.55)", fontSize: 11, lineHeight: 15 },
+
+  dropBtn: {
+    flexDirection: "row",
+    gap: 8,
+    alignItems: "center",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  dropBtnText: { color: "rgba(255,255,255,0.85)", fontWeight: "900", fontSize: 12 },
+
+  foot: { marginTop: 12, color: "rgba(255,255,255,0.45)", fontSize: 11, lineHeight: 15, textAlign: "center" },
+});

@@ -1,0 +1,33 @@
+from __future__ import annotations
+import inspect
+from typing import Any
+
+from app.additives_store import lookup_additive, additives_meta
+
+def apply_additives_patch(app) -> int:
+    patched = 0
+    for r in getattr(app, "routes", []):
+        if getattr(r, "path", None) == "/additives/{e_number}" and "GET" in (getattr(r, "methods", []) or []):
+            orig = getattr(r, "endpoint", None)
+            if not orig or getattr(orig, "__additives_wrapped__", False):
+                continue
+
+            if inspect.iscoroutinefunction(orig):
+                async def wrapped(*args, __orig=orig, **kwargs):
+                    e = kwargs.get("e_number") or (args[0] if args else "")
+                    row = lookup_additive(str(e))
+                    if row:
+                        return {"e_number": row["e_number"], "uk_fsa": row, "uk_fsa_meta": additives_meta()}
+                    return await __orig(*args, **kwargs)
+            else:
+                def wrapped(*args, __orig=orig, **kwargs):
+                    e = kwargs.get("e_number") or (args[0] if args else "")
+                    row = lookup_additive(str(e))
+                    if row:
+                        return {"e_number": row["e_number"], "uk_fsa": row, "uk_fsa_meta": additives_meta()}
+                    return __orig(*args, **kwargs)
+
+            wrapped.__additives_wrapped__ = True
+            r.endpoint = wrapped
+            patched += 1
+    return patched
