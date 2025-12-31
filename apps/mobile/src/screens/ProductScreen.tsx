@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Animated, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Alert, Animated, Image, Linking, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
@@ -7,42 +7,41 @@ import { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { ScanStackParamList, ProductTabKey } from "../navigation/ScanStack";
 import Chip from "../components/Chip";
-import InfoSheet from "../components/InfoSheet";
+import InfoSheet, { SheetSource } from "../components/InfoSheet";
 import { upsertRoutineItem } from "../store/routineStore";
 import { getPreferences } from "../store/preferencesStore";
-import { get } from "../lib/api";
-import { buildPlaceholderProduct, computeAdditivesRisk, computeAllergensCount } from "../utils/placeholderProduct";
+import { get, postJson } from "../lib/api";
 
 type Props = NativeStackScreenProps<ScanStackParamList, "Product">;
 type TabKey = ProductTabKey;
 
-function toneForEco(grade: string) {
-  if (grade === "A" || grade === "B") return "good";
-  if (grade === "C") return "warn";
-  return "bad";
-}
+type UiAdditiveLevel = "High" | "Medium" | "Low" | "Unknown";
+type UiAdditive = { code: string; name: string; level: UiAdditiveLevel };
+type UiAllergen = { name: string; status: "Listed" | "Not listed" };
 
-// API_LINK_START
-type ApiProduct = {
-  barcode?: string | null;
-  name?: string | null;
-  brand?: string | null;
+type UiProduct = {
+  barcode: string;
+  name: string;
+  brand: string;
   image_url?: string | null;
-
   ingredients_text?: string | null;
 
-  allergens?: unknown;
-  traces?: unknown;
-  additives?: unknown;
-  analysis?: unknown;
+  additives: UiAdditive[];
+  allergens: UiAllergen[];
+  traces: string[];
 
-  diet_flags?: { vegan?: boolean | null; vegetarian?: boolean | null } | null;
+  vegan: "Yes" | "No" | "Maybe" | "Unknown";
+  vegetarian: "Yes" | "No" | "Maybe" | "Unknown";
 
   nutriscore_grade?: string | null;
   ecoscore_grade?: string | null;
   ecoscore_score?: number | null;
 
-  health_score?: number | null;
+  // v1: we show additives score here (0..100)
+  healthScore: number;
+
+  // OFF summary block
+  off?: any | null;
 };
 
 function asStringList(v: unknown): string[] {
@@ -56,150 +55,252 @@ function asStringList(v: unknown): string[] {
   return [];
 }
 
-function cleanTag(s: string) {
-  return s.replace(/^en:/i, "").replace(/[_-]+/g, " ").trim();
-}
-
 function titleCase(s: string) {
-  const t = cleanTag(s);
-  return t ? t.charAt(0).toUpperCase() + t.slice(1) : t;
+  return String(s || "")
+    .trim()
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (m) => m.toUpperCase());
 }
 
-function toYesNo(v: boolean | null | undefined): "Yes" | "No" | "Unknown" {
+function cleanTag(s: string) {
+  return String(s || "").replace(/^([a-z]{2}:)/i, "").replace(/_/g, " ").trim();
+}
+
+function toYesNoMaybe(v: any, maybeFlag: boolean): "Yes" | "No" | "Maybe" | "Unknown" {
   if (v === true) return "Yes";
   if (v === false) return "No";
+  if (v === null || v === undefined) return maybeFlag ? "Maybe" : "Unknown";
   return "Unknown";
 }
 
-function normalizeEcoGrade(raw: unknown): string {
-  if (typeof raw !== "string" || !raw.trim()) return "—";
-  const g = raw.trim().toUpperCase();
-  if (g === "NOT-APPLICABLE") return "NA";
-  if (["A", "B", "C", "D", "E"].includes(g)) return g;
-  return g; // fallback (won't crash)
+function toneForEco(grade: string) {
+  const g = String(grade || "").toUpperCase();
+  if (g === "A" || g === "B") return "good";
+  if (g === "C") return "warn";
+  if (g === "D" || g === "E") return "bad";
+  return "neutral";
 }
 
-function ecoSummaryFrom(grade: string, score: number | null): string {
-  if (!grade || grade == "—") return "No Eco-Score data available for this product.";
-  if (grade === "NA") return "Eco-Score is not applicable for this product category.";
-  if (typeof score === "number") return `Eco-Score grade ${grade} (score ${score}).`;
-  return `Eco-Score grade ${grade}.`;
+function levelFromRisk(risk: string | null | undefined): UiAdditiveLevel {
+  const r = String(risk || "").toLowerCase();
+  if (r === "high") return "High";
+  if (r === "medium") return "Medium";
+  if (r === "low") return "Low";
+  return "Unknown";
 }
 
-function healthScoreFrom(api: any, fallback: number): number {
-  if (typeof api?.health_score === "number") return api.health_score;
-  const ng = (typeof api?.nutriscore_grade === "string" ? api.nutriscore_grade : "").trim().toUpperCase();
-  const map: Record<string, number> = { A: 90, B: 75, C: 60, D: 40, E: 20 };
-  return map[ng] ?? fallback ?? 0;
+function computeAdditivesRisk(adds: UiAdditive[]): UiAdditiveLevel {
+  if (!adds?.length) return "Low";
+  const levels = new Set(adds.map((a) => a.level));
+  if (levels.has("High")) return "High";
+  if (levels.has("Medium")) return "Medium";
+  if (levels.has("Unknown")) return "Unknown";
+  return "Low";
 }
 
-function allergenListed(name: string, apiAllergens: string[]) {
-  const n = name.toLowerCase();
-  return apiAllergens.some((a) => {
-    const x = cleanTag(a).toLowerCase();
-    if (!x) return false;
-    if (x.includes(n) || n.includes(x)) return true;
-
-    // common equivalences:
-    if ((n === "dairy" || n === "milk") && (x.includes("milk") || x.includes("dairy"))) return true;
-    if (n === "nuts" && (x.includes("nuts") || x.includes("peanut") || x.includes("tree nut"))) return true;
-    if (n === "gluten" && (x.includes("gluten") || x.includes("wheat") || x.includes("barley") || x.includes("rye")))
-      return true;
-
-    return false;
-  });
+function buildPlaceholderProduct(barcode: string): UiProduct {
+  return {
+    barcode,
+    name: "Unknown product",
+    brand: "—",
+    image_url: null,
+    ingredients_text: null,
+    additives: [],
+    allergens: [],
+    traces: [],
+    vegan: "Unknown",
+    vegetarian: "Unknown",
+    nutriscore_grade: null,
+    ecoscore_grade: null,
+    ecoscore_score: null,
+    healthScore: 60,
+    off: null,
+  };
 }
-// NOTE: the above uses Python-like 'or/and/True/False' placeholders; we will replace it with valid TS below.
-function mergeApiIntoPlaceholder(base: any, api: ApiProduct | any) {
-  const out: any = { ...base };
+
+function mergeApiIntoProduct(base: UiProduct, api: any): UiProduct {
+  const out: UiProduct = { ...base };
 
   const b = String(api?.barcode ?? api?.code ?? out.barcode ?? "").trim();
   if (b) out.barcode = b;
 
-  const name = typeof api?.name === "string" ? api.name : (typeof api?.product_name === "string" ? api.product_name : null);
-  if (name && name.trim()) out.name = name.trim();
+  const nm =
+    typeof api?.name === "string"
+      ? api.name
+      : typeof api?.product_name === "string"
+        ? api.product_name
+        : null;
+  if (nm && nm.trim()) out.name = nm.trim();
 
-  const brand = typeof api?.brand === "string" ? api.brand : (typeof api?.brands === "string" ? api.brands : null);
-  if (brand && brand.trim()) out.brand = brand.trim();
+  const br =
+    typeof api?.brand === "string"
+      ? api.brand
+      : typeof api?.brands === "string"
+        ? api.brands
+        : null;
+  if (br && br.trim()) out.brand = br.trim();
 
-  const ecoGrade = normalizeEcoGrade(api?.ecoscore_grade);
-  const ecoScore = typeof api?.ecoscore_score === "number" ? api.ecoscore_score : null;
+  if (typeof api?.image_url === "string" && api.image_url.trim()) out.image_url = api.image_url.trim();
+  if (typeof api?.ingredients_text === "string" && api.ingredients_text.trim()) out.ingredients_text = api.ingredients_text.trim();
 
-  out.eco = out.eco ?? {};
-  out.eco.grade = ecoGrade;
-  out.eco.summary = ecoSummaryFrom(ecoGrade, ecoScore);
+  out.nutriscore_grade = typeof api?.nutriscore_grade === "string" ? api.nutriscore_grade : out.nutriscore_grade;
+  out.ecoscore_grade = typeof api?.ecoscore_grade === "string" ? api.ecoscore_grade : out.ecoscore_grade;
+  out.ecoscore_score = typeof api?.ecoscore_score === "number" ? api.ecoscore_score : out.ecoscore_score;
 
-  out.vegan = toYesNo(api?.diet_flags?.vegan);
-  out.vegetarian = toYesNo(api?.diet_flags?.vegetarian);
+  out.off = api?.off ?? null;
 
-  // healthScore must remain a number (UI uses it for progress bar)
-  out.healthScore = healthScoreFrom(api, typeof out.healthScore === "number" ? out.healthScore : 60);
+  // diet flags
+  const tags = Array.isArray(api?.analysis) ? api.analysis : [];
+  const maybeVegan = tags.some((x: any) => String(x).toLowerCase().includes("vegan"));
+  const maybeVeg = tags.some((x: any) => String(x).toLowerCase().includes("vegetarian"));
+  out.vegan = toYesNoMaybe(api?.diet_flags?.vegan, maybeVegan);
+  out.vegetarian = toYesNoMaybe(api?.diet_flags?.vegetarian, maybeVeg);
 
-  // additives: backend returns string[] like ["E102","E211"] => UI expects objects with code/name/level
-  const apiAdditives = asStringList(api?.additives).map((x) => x.trim()).filter(Boolean);
-  out.additives = apiAdditives.map((code) => {
-    const c = code.toUpperCase();
-    return { code: c, name: c, level: "Unknown" };
-  });
+  // additives from product endpoint (string list)
+  const adds = asStringList(api?.additives)
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .map((x) => x.toUpperCase());
+  out.additives = adds.map((code) => ({ code, name: code, level: "Unknown" }));
 
-  // allergens: backend returns string[]; UI expects [{name,status}]
-  const apiAllergens = asStringList(api?.allergens).map((x) => x.trim()).filter(Boolean);
+  // allergens/traces from product endpoint (string list)
+  const alls = asStringList(api?.allergens).map((x) => cleanTag(x)).filter(Boolean);
+  const trs = asStringList(api?.traces).map((x) => cleanTag(x)).filter(Boolean);
+  out.traces = trs;
 
-  if (Array.isArray(out.allergens) && out.allergens.length && typeof out.allergens[0] === "object") {
-    // keep the existing allergen rows in UI, only update statuses
-    out.allergens = out.allergens.map((a: any) => {
-      const nm = typeof a?.name === "string" ? a.name : "";
-      return { ...a, status: nm && allergenListed(nm, apiAllergens) ? "Listed" : "Not listed" };
-    });
+  out.allergens = alls.length
+    ? alls.map((a) => ({ name: titleCase(a), status: "Listed" as const }))
+    : [];
 
-    // add any extra allergens not already present in base list
-    const baseNames = new Set(out.allergens.map((a: any) => String(a?.name ?? "").toLowerCase()));
-    for (const raw of apiAllergens) {
-      const pretty = titleCase(raw);
-      if (pretty && !baseNames.has(pretty.toLowerCase())) {
-        out.allergens.push({ name: pretty, status: "Listed" });
-      }
-    }
-  } else {
-    out.allergens = apiAllergens.map((x) => ({ name: titleCase(x), status: "Listed" }));
-  }
-
-  // keep sources stable (InfoSheet expects it)
-  out.sources = Array.isArray(out.sources) ? out.sources : [];
+  // v1 score preference: backend returns additive_score on /products
+  if (typeof api?.additive_score === "number") out.healthScore = api.additive_score;
+  else if (typeof api?.health_score === "number") out.healthScore = api.health_score;
 
   return out;
 }
 
-// API_LINK_END
+function Card({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <View style={styles.card}>
+      <Text style={styles.cardTitle}>{title}</Text>
+      <View style={{ marginTop: 10 }}>{children}</View>
+    </View>
+  );
+}
 
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.row}>
+      <Text style={styles.rowLabel}>{label}</Text>
+      <Text style={styles.rowValue}>{value}</Text>
+    </View>
+  );
+}
 
-export default function ProductScreen({ route, navigation }: Props) {
-  const { barcode } = route.params;
-  const initialTab = (route.params?.initialTab as TabKey | undefined) ?? "Health";
+function SkeletonLines() {
+  return (
+    <View style={{ gap: 10 }}>
+      <View style={styles.skel} />
+      <View style={styles.skel} />
+      <View style={[styles.skel, { width: "72%" }]} />
+    </View>
+  );
+}
 
-  const [tab, setTab] = useState<TabKey>(initialTab);
-  const [sheet, setSheet] = useState<null | { title: string; body: string }>(null);
+type NutriBarProps = {
+  label: string;
+  value: number | null;
+  unit: string;
+  bounds: [number, number, number, number, number]; // low..high thresholds (simple)
+};
 
-  // Skeleton loading (UI only)
+function clamp01(x: number) {
+  if (x < 0) return 0;
+  if (x > 1) return 1;
+  return x;
+}
+
+function NutriBar({ label, value, unit, bounds }: NutriBarProps) {
+  const v = typeof value === "number" ? value : null;
+  const max = bounds[4] > 0 ? bounds[4] : 1;
+  const pct = v == null ? 0 : clamp01(v / max);
+
+  return (
+    <View style={{ gap: 6 }}>
+      <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+        <Text style={styles.nLabel}>{label}</Text>
+        <Text style={styles.nValue}>{v == null ? "—" : `${v}${unit}`}</Text>
+      </View>
+      <View style={styles.nTrack}>
+        <View style={[styles.nFill, { width: `${Math.round(pct * 100)}%` }]} />
+      </View>
+      <Text style={styles.nHint}>
+        Thresholds: {bounds[1]} / {bounds[2]} / {bounds[3]} / {bounds[4]} {unit.trim()}
+      </Text>
+    </View>
+  );
+}
+
+export default function ProductScreen({ route }: Props) {
+  const barcode = String((route as any)?.params?.barcode ?? "").trim();
+
   const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState<TabKey>("Health");
+  const [product, setProduct] = useState<UiProduct>(() => buildPlaceholderProduct(barcode));
+
+  const [sheet, setSheet] = useState<{ title: string; body: string; sources?: SheetSource[] } | null>(null);
+
+  const scoreAnim = useRef(new Animated.Value(0)).current;
+
+  const additivesRisk = useMemo(() => computeAdditivesRisk(product.additives), [product.additives]);
+  const allergensCount = useMemo(() => product.allergens.filter((a) => a.status === "Listed").length, [product.allergens]);
+
   useEffect(() => {
     let cancelled = false;
-    let t: any = null;
-    const started = Date.now();
-  
-    setLoading(true);
-    // always start from the placeholder shape so the UI never breaks
-    const base = buildPlaceholderProduct(barcode);
-    setProduct(base);
-  
-    (async () => {
+    let t: any;
+
+    const run = async () => {
+      const started = Date.now();
+      setLoading(true);
+
+      const base = buildPlaceholderProduct(barcode);
+      setProduct(base);
+
       try {
-        const raw: any = await get<any>("/products/" + encodeURIComponent(barcode));
+        const raw: any = await get<any>(`/products/${encodeURIComponent(barcode)}?include_off=true`);
         const api: any = raw?.product ?? raw?.data ?? raw;
         if (cancelled) return;
-        setProduct(mergeApiIntoPlaceholder(base, api));
+
+        let merged = mergeApiIntoProduct(base, api);
+
+        // if we have additives, enrich from /additives/batch to get name + risk + score
+        const eNumbers = merged.additives.map((a) => a.code).filter(Boolean);
+        if (eNumbers.length) {
+          try {
+            const batch: any = await postJson<any>("/additives/batch", { e_numbers: eNumbers });
+            const rows: any[] = Array.isArray(batch?.additives) ? batch.additives : [];
+            const map = new Map<string, any>();
+            for (const r of rows) map.set(String(r?.e_number || "").toUpperCase(), r);
+
+            merged = {
+              ...merged,
+              additives: merged.additives.map((a) => {
+                const r = map.get(a.code);
+                return {
+                  code: a.code,
+                  name: String(r?.name ?? a.name ?? a.code),
+                  level: levelFromRisk(r?.risk_level),
+                };
+              }),
+              healthScore: typeof batch?.score?.score === "number" ? batch.score.score : merged.healthScore,
+            };
+          } catch (e) {
+            // keep base additive list if batch fails
+          }
+        }
+
+        setProduct(merged);
       } catch (e: any) {
-        // keep placeholder if API fails (no UI/layout change)
         console.warn("Product fetch failed:", e?.message ?? e);
       } finally {
         const ms = Date.now() - started;
@@ -208,145 +309,139 @@ export default function ProductScreen({ route, navigation }: Props) {
           if (!cancelled) setLoading(false);
         }, wait);
       }
-    })();
-  
+    };
+
+    run();
     return () => {
       cancelled = true;
       if (t) clearTimeout(t);
     };
   }, [barcode]);
-  const [product, setProduct] = useState(() => buildPlaceholderProduct(barcode));
-  const prefs = useMemo(() => getPreferences(), []);
 
-  useEffect(() => {
-    navigation.setOptions({ title: product.name });
-  }, [navigation, product.name]);
-
-  useEffect(() => {
-    setTab(initialTab);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [barcode, route.params?.initialTab]);
-
-  // profile-based matches
-  const allergenMatches = useMemo(() => {
-    const out: string[] = [];
-    const want = prefs.allergies;
-    for (const a of product.allergens) {
-      const active =
-        (a.name === "Nuts" && want.nuts) ||
-        (a.name === "Gluten" && want.gluten) ||
-        ((a.name === "Dairy" || a.name === "Milk") && want.dairy) ||
-        (a.name === "Eggs" && want.eggs) ||
-        (a.name === "Soy" && want.soy);
-
-      if (active && a.status !== "Not listed") out.push(a.name);
-    }
-    return out;
-  }, [prefs.allergies, product.allergens]);
-
-  const dietMismatch = useMemo(() => {
-    const wantsVegan = prefs.diet.vegan;
-    const wantsVeg = prefs.diet.vegetarian;
-
-    if (wantsVegan && product.vegan === "No") return "Vegan";
-    if (wantsVeg && product.vegetarian === "No") return "Vegetarian";
-    return null;
-  }, [prefs.diet, product.vegan, product.vegetarian]);
-
-  const allergensCount = computeAllergensCount(product);
-  const additivesRisk = computeAdditivesRisk(product);
-
-  const addToRoutine = () => {
-    upsertRoutineItem({
-      id: product.barcode,
-      barcode: product.barcode,
-      name: product.name,
-      brand: product.brand,
-      addedAtISO: new Date().toISOString(),
-      frequency: "Daily",
-      badges: {
-        eco: product.eco.grade,
-        vegan: product.vegan,
-        vegetarian: product.vegetarian,
-        allergensCount,
-        additivesRisk,
-      },
-    });
-    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-    Alert.alert("Added to Routine", "This item is now in your daily routine list (placeholder storage).");
-  };
-
-  // Animated score bar (instead of SVG ring, no new deps)
-  const scoreAnim = useRef(new Animated.Value(0)).current;
   useEffect(() => {
     const to = loading ? 0 : product.healthScore / 100;
-    Animated.timing(scoreAnim, { toValue: to, duration: 300, useNativeDriver: false }).start();
+    Animated.timing(scoreAnim, { toValue: to, duration: 500, useNativeDriver: false }).start();
   }, [loading, product.healthScore, scoreAnim]);
 
   const scoreWidth = scoreAnim.interpolate({ inputRange: [0, 1], outputRange: ["0%", "100%"] });
 
-  const setTabWithHaptic = (k: TabKey) => {
+  function setTabWithHaptic(k: TabKey) {
     setTab(k);
     Haptics.selectionAsync().catch(() => {});
-  };
+  }
+
+  function addToRoutine() {
+    try {
+      upsertRoutineItem({
+        barcode: product.barcode,
+        name: product.name,
+        brand: product.brand,
+        image_url: product.image_url ?? null,
+      } as any);
+      Alert.alert("Added to Routine", "This item is now in your daily routine list.");
+    } catch (e) {
+      Alert.alert("Error", "Could not add to routine.");
+    }
+  }
+
+  const off = (product as any)?.off ?? null;
+  const nutr = off?.nutriments ?? {};
+  const perRaw = String(off?.nutrition_data_per ?? "100g").trim();
+  const per = perRaw === "100g" ? "per 100 g/ml" : `per ${perRaw}`;
+
+  const nutriGrade = String((off?.nutriscore_grade ?? product.nutriscore_grade ?? "—")).toUpperCase();
+  const nova = off?.nova_group ?? "—";
+  const serving = off?.serving_size ?? "—";
+
+  const kcal100 = nutr["energy-kcal_100g"] ?? nutr["energy-kcal"] ?? null;
+  const sugar100 = nutr["sugars_100g"] ?? null;
+  const sat100 = nutr["saturated-fat_100g"] ?? nutr["saturated-fat"] ?? null;
+  const salt100 = nutr["salt_100g"] ?? null;
+
+  const ecoGrade = String(product.ecoscore_grade ?? "—");
+  const offUrl = `https://world.openfoodfacts.org/product/${encodeURIComponent(product.barcode)}`;
 
   return (
-    <SafeAreaView style={styles.container} edges={["bottom"]}>
-      <ScrollView contentContainerStyle={{ paddingBottom: 22 }} stickyHeaderIndices={[0]} showsVerticalScrollIndicator={false}>
-        {/* Sticky top section */}
-        <View style={styles.sticky}>
-          <View style={styles.headerTop}>
-            <Pressable style={styles.backBtn} onPress={() => navigation.goBack()}>
-              <Ionicons name="chevron-back" size={18} color="white" />
+    <SafeAreaView style={styles.screen} edges={["top"]}>
+      <ScrollView contentContainerStyle={{ paddingBottom: 28 }}>
+        {/* Header */}
+        <View style={styles.header}>
+          <View style={styles.hero}>
+            <View style={styles.heroRow}>
+              <View style={styles.imgWrap}>
+                {product.image_url ? (
+                  <Image source={{ uri: product.image_url }} style={styles.img} />
+                ) : (
+                  <View style={[styles.img, { alignItems: "center", justifyContent: "center" }]}>
+                    <Ionicons name="image-outline" size={22} color="rgba(255,255,255,0.65)" />
+                  </View>
+                )}
+              </View>
+
+              <View style={{ flex: 1 }}>
+                <Text style={styles.title} numberOfLines={1}>
+                  {loading ? "Loading…" : product.name}
+                </Text>
+                <Text style={styles.subtitle} numberOfLines={1}>
+                  {loading ? " " : `${product.brand} • ${product.barcode}`}
+                </Text>
+              </View>
+
+              <View style={styles.scorePill}>
+                <Text style={styles.scoreLabel}>Score</Text>
+                <Text style={styles.scoreValue}>{loading ? "…" : String(product.healthScore)}</Text>
+              </View>
+            </View>
+
+            {/* chips */}
+            <View style={styles.chipsRow}>
+              <Chip
+                label={loading ? "Eco …" : `Eco ${ecoGrade}`}
+                tone={toneForEco(ecoGrade) as any}
+              />
+              <Chip
+                label={loading ? "Vegan …" : `Vegan: ${product.vegan}`}
+                tone={product.vegan === "Yes" ? "good" : product.vegan === "No" ? "bad" : "neutral"}
+              />
+              <Chip
+                label={loading ? "Veg …" : `Veg: ${product.vegetarian}`}
+                tone={product.vegetarian === "Yes" ? "good" : product.vegetarian === "No" ? "bad" : "neutral"}
+              />
+              <Chip
+                label={loading ? "Allergens …" : `Allergens: ${allergensCount}`}
+                tone={allergensCount ? "warn" : "good"}
+              />
+              <Chip
+                label={loading ? "Additives …" : `Additives: ${product.additives.length}`}
+                tone={additivesRisk === "High" ? "bad" : additivesRisk === "Medium" ? "warn" : additivesRisk === "Low" ? "good" : "neutral"}
+              />
+            </View>
+
+            <Pressable style={styles.primaryBtn} onPress={addToRoutine} disabled={loading}>
+              <Ionicons name="add-circle-outline" size={18} color="white" />
+              <Text style={styles.primaryText}>Add to my Routine</Text>
             </Pressable>
 
-            <View style={{ flex: 1 }}>
-              <Text style={styles.title} numberOfLines={1}>
-                {loading ? "Loading…" : product.name}
-              </Text>
-              <Text style={styles.subtitle} numberOfLines={1}>
-                {loading ? " " : `${product.brand} • ${product.barcode}`}
-              </Text>
+            <Pressable
+              style={[styles.cta, { marginTop: 10 }]}
+              onPress={() => Linking.openURL(offUrl)}
+              disabled={!product.barcode}
+            >
+              <Ionicons name="link-outline" size={18} color="rgba(255,255,255,0.9)" />
+              <Text style={styles.ctaText}>Open on OpenFoodFacts</Text>
+            </Pressable>
+
+            {/* Tabs */}
+            <View style={styles.tabs}>
+              {(["Health", "Additives", "Allergens", "Diet", "Eco"] as TabKey[]).map((k) => {
+                const active = tab === k;
+                return (
+                  <Pressable key={k} onPress={() => setTabWithHaptic(k)} style={[styles.tab, active ? styles.tabActive : null]}>
+                    <Text style={[styles.tabText, active ? styles.tabTextActive : null]}>{k}</Text>
+                  </Pressable>
+                );
+              })}
             </View>
-
-            <View style={styles.scorePill}>
-              <Text style={styles.scoreLabel}>Score</Text>
-              <Text style={styles.scoreValue}>{loading ? "…" : product.healthScore}</Text>
-            </View>
-          </View>
-
-          {/* chips */}
-          <View style={styles.chipsRow}>
-            <Chip label={loading ? "Eco …" : `Eco ${product.eco.grade}`} tone={toneForEco(product.eco.grade) as any} />
-            <Chip label={loading ? "Vegan …" : `Vegan: ${product.vegan}`} tone={product.vegan === "Yes" ? "good" : product.vegan === "No" ? "bad" : "neutral"} />
-            <Chip label={loading ? "Veg …" : `Veg: ${product.vegetarian}`} tone={product.vegetarian === "Yes" ? "good" : product.vegetarian === "No" ? "bad" : "neutral"} />
-
-            <Chip
-              label={loading ? "Allergens …" : `Allergens: ${allergensCount}`}
-              tone={allergenMatches.length ? "bad" : allergensCount ? "warn" : "good"}
-            />
-
-            <Chip
-              label={loading ? "Additives …" : `Additives: ${product.additives.length}`}
-              tone={additivesRisk === "High" ? "bad" : additivesRisk === "Medium" ? "warn" : "good"}
-            />
-          </View>
-
-          <Pressable style={styles.primaryBtn} onPress={addToRoutine} disabled={loading}>
-            <Ionicons name="add-circle-outline" size={18} color="white" />
-            <Text style={styles.primaryText}>Add to my Routine</Text>
-          </Pressable>
-
-          {/* Tabs */}
-          <View style={styles.tabs}>
-            {(["Health", "Additives", "Allergens", "Diet", "Eco"] as TabKey[]).map((k) => {
-              const active = tab === k;
-              return (
-                <Pressable key={k} onPress={() => setTabWithHaptic(k)} style={[styles.tab, active ? styles.tabActive : null]}>
-                  <Text style={[styles.tabText, active ? styles.tabTextActive : null]}>{k}</Text>
-                </Pressable>
-              );
-            })}
           </View>
         </View>
 
@@ -354,46 +449,46 @@ export default function ProductScreen({ route, navigation }: Props) {
         <View style={{ paddingHorizontal: 16, paddingTop: 14, gap: 12 }}>
           {tab === "Health" ? (
             <>
-              <Card title="Health score">
-                <Text style={styles.p}>Placeholder score. Later: compute from nutrition + additives + profile.</Text>
+              <Card title="Overview (v1)">
+                <Text style={styles.p}>This “Score” is the additives score from your backend (v1). Later we combine nutrition + additives + eco.</Text>
 
                 <View style={styles.progressTrack}>
                   <Animated.View style={[styles.progressFill, { width: scoreWidth }]} />
                 </View>
 
-                <Row label="Overall" value={loading ? "…" : `${product.healthScore}/100`} />
+                <Row label="Additives score" value={loading ? "…" : `${product.healthScore}/100`} />
                 <Row label="Additives risk" value={loading ? "…" : additivesRisk} />
-                <Row label="Allergens flagged" value={loading ? "…" : `${allergensCount}`} />
+                <Row label="Allergens listed" value={loading ? "…" : `${allergensCount}`} />
 
-                <Pressable
-                  style={styles.moreBtn}
-                  onPress={() =>
-                    setSheet({
-                      title: "How the Health score works (placeholder)",
-                      body:
-                        "Later this explains your scoring logic clearly:\n\n• Ingredient quality\n• Additives severity\n• Profile-based risks\n\nAnd shows citations + confidence.",
-                    })
-                  }
-                >
-                  <Text style={styles.moreText}>More</Text>
-                  <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.8)" />
-                </Pressable>
+                <View style={{ marginTop: 12 }}>
+                  <Row label="Nutri-Score" value={loading ? "…" : nutriGrade} />
+                  <Row label="NOVA" value={loading ? "…" : String(nova)} />
+                  <Row label="Serving size" value={loading ? "…" : String(serving)} />
+                  <Row label="Calories (per 100g/ml)" value={loading ? "…" : (kcal100 == null ? "—" : `${kcal100} kcal`)} />
+                  <Row label="Sugar (per 100g/ml)" value={loading ? "…" : (sugar100 == null ? "—" : `${sugar100} g`)} />
+                  <Row label="Salt (per 100g/ml)" value={loading ? "…" : (salt100 == null ? "—" : `${salt100} g`)} />
+                </View>
               </Card>
 
-              {(allergenMatches.length || dietMismatch) && !loading ? (
-                <Card title="Matches your profile">
-                  {allergenMatches.length ? (
-                    <Text style={styles.p}>⚠️ Allergy match: {allergenMatches.join(", ")}.</Text>
-                  ) : null}
-                  {dietMismatch ? <Text style={[styles.p, { marginTop: 6 }]}>⚠️ Diet mismatch: not {dietMismatch}.</Text> : null}
-                </Card>
-              ) : null}
+              <Card title={`Nutrition bars (${per})`}>
+                {loading ? <SkeletonLines /> : null}
+                {!loading ? (
+                  <View style={{ marginTop: 10, gap: 14 }}>
+                    <NutriBar label="Energy" value={typeof kcal100 === "number" ? kcal100 : null} unit=" kcal" bounds={[0, 1, 14, 35, 65]} />
+                    <NutriBar label="Sugar" value={typeof sugar100 === "number" ? sugar100 : null} unit=" g" bounds={[0, 1.5, 3, 7, 13]} />
+                    <NutriBar label="Saturates" value={typeof sat100 === "number" ? sat100 : null} unit=" g" bounds={[0, 1, 3, 6, 10]} />
+                    <NutriBar label="Salt" value={typeof salt100 === "number" ? salt100 : null} unit=" g" bounds={[0, 0.23, 0.7, 1.4, 2.3]} />
+                  </View>
+                ) : null}
+              </Card>
             </>
           ) : null}
 
           {tab === "Additives" ? (
-            <Card title="Additives found (placeholder)">
+            <Card title="Additives found">
               {loading ? <SkeletonLines /> : null}
+
+              {!loading && !product.additives.length ? <Text style={styles.p}>No additives listed.</Text> : null}
 
               {!loading
                 ? product.additives.map((a) => (
@@ -408,14 +503,100 @@ export default function ProductScreen({ route, navigation }: Props) {
                       <Pressable
                         style={[
                           styles.badge,
-                          a.level === "High" ? styles.badgeBad : a.level === "Medium" ? styles.badgeWarn : styles.badgeGood,
+                          a.level === "High" ? styles.badgeBad : a.level === "Medium" ? styles.badgeWarn : a.level === "Low" ? styles.badgeGood : styles.badgeNeutral,
                         ]}
-                        onPress={() =>
-                          setSheet({
-                            title: `${a.code} • ${a.name}`,
-                            body: a.why + "\n\nLater: evidence, confidence, and references.",
-                          })
-                        }
+                        onPress={() => {
+                          (async () => {
+                            const code = String(a?.code ?? "").toUpperCase().trim();
+                            const name = String(a?.name ?? code).trim() || code;
+                            if (!code) return;
+
+                            setSheet({ title: `${code} • ${name}`, body: "Loading evidence and sources…" });
+
+                            try {
+                              const detail: any = await get<any>(`/additives/${encodeURIComponent(code)}`);
+                              const additive: any = detail?.additive ?? detail ?? {};
+                              const effects: any[] = Array.isArray(detail?.effects)
+                                ? detail.effects
+                                : Array.isArray(additive?.effects)
+                                  ? additive.effects
+                                  : [];
+
+                              const risk = levelFromRisk(additive?.risk_level ?? detail?.risk_level ?? null);
+                              const sourceTitle = String(additive?.source_title ?? detail?.source_title ?? "").trim();
+                              const sourceUrl = String(additive?.source_url ?? detail?.source_url ?? "").trim();
+                              const sourceDate = String(additive?.source_date ?? detail?.source_date ?? "").trim();
+                              const func = String(additive?.functional_class ?? detail?.functional_class ?? "").trim();
+                              const adi = additive?.adi ?? detail?.adi ?? null;
+                              const note = String(additive?.note ?? detail?.note ?? "").trim();
+
+                              const groups = (x: any) => {
+                                const s = String(x ?? "").trim();
+                                if (!s || s === "no-group") return null;
+                                return s.split(",").map((t) => t.trim()).filter(Boolean).join(", ");
+                              };
+
+                              const mean = groups(additive?.exposure_mean_gt_adi ?? detail?.exposure_mean_gt_adi);
+                              const p95 = groups(additive?.exposure_p95_gt_adi ?? detail?.exposure_p95_gt_adi);
+
+                              const mkEffects = () => {
+                                if (!effects.length) return null;
+                                return effects.slice(0, 8).map((x: any) => {
+                                  const endpoint = String(x?.endpoint ?? "").trim();
+                                  const effect = String(x?.effect ?? "").trim();
+                                  const species = String(x?.species ?? "").trim();
+                                  const year = x?.year ? String(x.year) : "";
+                                  const parts = [endpoint && `(${endpoint})`, effect, species && `[${species}]`, year].filter(Boolean);
+                                  return "• " + parts.join(" ");
+                                }).join("\n");
+                              };
+
+                              const effectsText = mkEffects();
+                              const exposureLine =
+                                mean || p95
+                                  ? `Exposure above guidance levels reported for: ${[
+                                      mean ? "mean: " + mean : null,
+                                      p95 ? "P95: " + p95 : null,
+                                    ].filter(Boolean).join(" • ")}`
+                                  : null;
+
+                              const whatWeKnow =
+                                effectsText ??
+                                exposureLine ??
+                                (note || "No structured effect rows in our DB yet for this additive. Use sources below for full context.");
+
+                              const fsaSlug = "e-" + code.slice(1).toLowerCase();
+                              const fsaUrl = `https://data.food.gov.uk/regulated-products/food_authorisations/${fsaSlug}`;
+                              const fsaListUrl = "https://www.food.gov.uk/business-guidance/approved-additives-and-e-numbers";
+                              const offAddUrl = `https://world.openfoodfacts.org/additive/en:${code.toLowerCase()}`;
+
+                              const body =
+                                `Risk level: ${risk}\n` +
+                                (func ? `Functional class: ${func}\n` : "") +
+                                (adi ? `ADI: ${adi}\n` : "") +
+                                `\nWhat we know so far:\n${whatWeKnow}\n\n` +
+                                `Sources:\n` +
+                                `• UK FSA register: ${fsaUrl}\n` +
+                                `• Open Food Facts additive page: ${offAddUrl}\n` +
+                                (sourceUrl ? `• ${sourceTitle || "EFSA/Scientific source"}${sourceDate ? " (" + sourceDate + ")" : ""}: ${sourceUrl}\n` : "") +
+                                `• UK FSA approved additives list: ${fsaListUrl}\n\n` +
+                                `Note: Not medical advice. Check labels and consult professionals.`;
+
+                              const sources: SheetSource[] = [];
+                              if (sourceUrl) sources.push({ label: sourceTitle || "EFSA/Scientific source", url: sourceUrl });
+                              sources.push({ label: "UK FSA register", url: fsaUrl });
+                              sources.push({ label: "Open Food Facts additive page", url: offAddUrl });
+                              sources.push({ label: "UK FSA approved additives list", url: fsaListUrl });
+
+                              setSheet({ title: `${code} • ${name}`, body, sources });
+                            } catch (e: any) {
+                              setSheet({
+                                title: `${a.code} • ${a.name}`,
+                                body: `Could not load additive details.\n\nTry again. Error: ${String(e?.message ?? e)}`,
+                              });
+                            }
+                          })();
+                        }}
                       >
                         <Text style={styles.badgeText}>More</Text>
                       </Pressable>
@@ -426,169 +607,104 @@ export default function ProductScreen({ route, navigation }: Props) {
           ) : null}
 
           {tab === "Allergens" ? (
-            <Card title="Allergens (placeholder)">
-              {!loading && allergenMatches.length ? (
-                <View style={styles.profileWarn}>
-                  <Ionicons name="alert-circle-outline" size={18} color="white" />
-                  <Text style={styles.profileWarnText}>Matches your allergy profile: {allergenMatches.join(", ")}</Text>
-                </View>
-              ) : null}
-
+            <Card title="Allergens & traces">
               {loading ? <SkeletonLines /> : null}
-
-              {!loading
-                ? product.allergens.map((a) => (
-                    <View key={a.name} style={styles.listRow}>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.rowTitle}>{a.name}</Text>
-                        <Text style={styles.rowSub}>{a.status}</Text>
-                      </View>
-
-                      <Pressable
-                        style={styles.smallMore}
-                        onPress={() =>
-                          setSheet({
-                            title: `${a.name} • Explanation (placeholder)`,
-                            body:
-                              "Later: show why this allergen is flagged and the evidence (label parsing / may contain) + citations.",
-                          })
-                        }
-                      >
-                        <Text style={styles.smallMoreText}>More</Text>
-                      </Pressable>
-                    </View>
-                  ))
-                : null}
+              {!loading ? (
+                <>
+                  <Text style={styles.p}>
+                    Allergens listed: {allergensCount ? product.allergens.filter((a) => a.status === "Listed").map((a) => a.name).join(", ") : "None listed."}
+                  </Text>
+                  <Text style={[styles.p, { marginTop: 8 }]}>
+                    Traces: {product.traces.length ? product.traces.map((t) => titleCase(cleanTag(t))).join(", ") : "No traces listed."}
+                  </Text>
+                </>
+              ) : null}
             </Card>
           ) : null}
 
           {tab === "Diet" ? (
-            <Card title="Diet compatibility (placeholder)">
-              {dietMismatch && !loading ? (
-                <View style={styles.profileWarn}>
-                  <Ionicons name="alert-circle-outline" size={18} color="white" />
-                  <Text style={styles.profileWarnText}>This product conflicts with your preference: {dietMismatch}</Text>
-                </View>
+            <Card title="Diet compatibility">
+              {loading ? <SkeletonLines /> : null}
+              {!loading ? (
+                <>
+                  <Row label="Vegan" value={product.vegan} />
+                  <Row label="Vegetarian" value={product.vegetarian} />
+                  <Text style={[styles.p, { marginTop: 10 }]}>
+                    V1 uses backend flags + “maybe” tags. Later we can add stronger logic and sources per ingredient/additive.
+                  </Text>
+                </>
               ) : null}
-
-              <Row label="Vegan" value={loading ? "…" : product.vegan} />
-              <Row label="Vegetarian" value={loading ? "…" : product.vegetarian} />
-
-              <Pressable
-                style={styles.moreBtn}
-                onPress={() =>
-                  setSheet({
-                    title: "How vegan/vegetarian is determined (placeholder)",
-                    body: "Later: use ingredients + additives + traces, and explain unknown cases clearly.",
-                  })
-                }
-              >
-                <Text style={styles.moreText}>More</Text>
-                <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.8)" />
-              </Pressable>
             </Card>
           ) : null}
 
           {tab === "Eco" ? (
-            <Card title="Environmental impact (placeholder)">
-              <Row label="Eco score" value={loading ? "…" : product.eco.grade} />
-              <Text style={styles.p}>{loading ? " " : product.eco.summary}</Text>
-
-              <Pressable
-                style={styles.moreBtn}
-                onPress={() =>
-                  setSheet({
-                    title: `Eco score ${product.eco.grade} • Details (placeholder)`,
-                    body: "Later: show packaging/origin/farming/transport breakdown + citations.",
-                  })
-                }
-              >
-                <Text style={styles.moreText}>More</Text>
-                <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.8)" />
-              </Pressable>
+            <Card title="Environmental impact">
+              {loading ? <SkeletonLines /> : null}
+              {!loading ? (
+                <>
+                  <Row label="Eco-Score grade" value={String(product.ecoscore_grade ?? "—")} />
+                  <Row label="Eco-Score score" value={product.ecoscore_score == null ? "—" : String(product.ecoscore_score)} />
+                  <Pressable
+                    style={[styles.cta, { marginTop: 10 }]}
+                    onPress={() => Linking.openURL(offUrl)}
+                  >
+                    <Ionicons name="leaf-outline" size={18} color="rgba(255,255,255,0.9)" />
+                    <Text style={styles.ctaText}>Open OFF eco details</Text>
+                  </Pressable>
+                </>
+              ) : null}
             </Card>
           ) : null}
 
-          <View style={styles.footer}>
-            <Text style={styles.footerText}>
-              Disclaimer: placeholder UI. Not medical advice. Always check labels and consult professionals for health decisions.
-            </Text>
-          </View>
+          <Text style={styles.foot}>
+            Disclaimer: Not medical advice. Always check labels and consult professionals for health decisions.
+          </Text>
         </View>
       </ScrollView>
 
-      <InfoSheet visible={!!sheet} title={sheet?.title ?? ""} body={sheet?.body ?? ""} sources={product.sources} onClose={() => setSheet(null)} />
+      <InfoSheet
+        visible={!!sheet}
+        title={sheet?.title ?? ""}
+        body={sheet?.body ?? ""}
+        sources={sheet?.sources ?? []}
+        onClose={() => setSheet(null)}
+      />
     </SafeAreaView>
   );
 }
 
-function Card({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <View style={styles.card}>
-      <Text style={styles.cardTitle}>{title}</Text>
-      {children}
-    </View>
-  );
-}
-
-function Row({ label, value }: { label: string; value: string }) {
-  return (
-    <View style={styles.kvRow}>
-      <Text style={styles.k}>{label}</Text>
-      <Text style={styles.v}>{value}</Text>
-    </View>
-  );
-}
-
-function SkeletonLines() {
-  return (
-    <View style={{ gap: 10, marginTop: 8 }}>
-      <View style={styles.skelLine} />
-      <View style={[styles.skelLine, { width: "82%" }]} />
-      <View style={[styles.skelLine, { width: "66%" }]} />
-    </View>
-  );
-}
-
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#0b0f14" },
+  screen: { flex: 1, backgroundColor: "#06090d" },
 
-  sticky: {
+  header: { paddingHorizontal: 16, paddingTop: 10 },
+  hero: {
+    borderRadius: 22,
+    padding: 14,
     backgroundColor: "#0b0f14",
-    paddingHorizontal: 16,
-    paddingTop: 10,
-    paddingBottom: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: "rgba(255,255,255,0.08)",
-  },
-  headerTop: { flexDirection: "row", alignItems: "center", gap: 10 },
-  backBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 999,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(0,0,0,0.55)",
     borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.16)",
+    borderColor: "rgba(255,255,255,0.10)",
   },
-  title: { color: "white", fontSize: 16, fontWeight: "900" },
-  subtitle: { color: "rgba(255,255,255,0.65)", fontSize: 12, fontWeight: "800", marginTop: 2 },
+  heroRow: { flexDirection: "row", gap: 12, alignItems: "center" },
+  imgWrap: { width: 62, height: 62, borderRadius: 16, overflow: "hidden", backgroundColor: "rgba(255,255,255,0.06)" },
+  img: { width: "100%", height: "100%" },
+
+  title: { color: "white", fontWeight: "900", fontSize: 16 },
+  subtitle: { color: "rgba(255,255,255,0.60)", marginTop: 2, fontSize: 12 },
 
   scorePill: {
-    width: 66,
-    height: 46,
+    width: 62,
+    height: 62,
     borderRadius: 16,
-    backgroundColor: "rgba(147,197,253,0.12)",
-    borderWidth: 1,
-    borderColor: "rgba(147,197,253,0.22)",
     alignItems: "center",
     justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
   },
-  scoreLabel: { color: "rgba(255,255,255,0.70)", fontSize: 10, fontWeight: "900" },
+  scoreLabel: { color: "rgba(255,255,255,0.60)", fontSize: 11, fontWeight: "800" },
   scoreValue: { color: "white", fontSize: 18, fontWeight: "900", marginTop: 2 },
 
-  chipsRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 10 },
+  chipsRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 12 },
 
   primaryBtn: {
     marginTop: 12,
@@ -597,118 +713,97 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     paddingVertical: 12,
-    borderRadius: 18,
-    backgroundColor: "rgba(56,189,248,0.16)",
+    borderRadius: 16,
+    backgroundColor: "rgba(255,255,255,0.10)",
     borderWidth: 1,
-    borderColor: "rgba(56,189,248,0.28)",
+    borderColor: "rgba(255,255,255,0.12)",
   },
   primaryText: { color: "white", fontWeight: "900" },
 
-  tabs: { flexDirection: "row", gap: 8, marginTop: 12 },
+  cta: {
+    flexDirection: "row",
+    gap: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 11,
+    borderRadius: 16,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  ctaText: { color: "rgba(255,255,255,0.92)", fontWeight: "900" },
+
+  tabs: { flexDirection: "row", gap: 8, marginTop: 14, flexWrap: "wrap" },
   tab: {
-    paddingVertical: 9,
+    paddingVertical: 8,
     paddingHorizontal: 12,
     borderRadius: 999,
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.10)",
     backgroundColor: "rgba(255,255,255,0.04)",
   },
-  tabActive: {
-    backgroundColor: "rgba(0,0,0,0.55)",
-    borderColor: "rgba(255,255,255,0.16)",
-  },
-  tabText: { color: "rgba(255,255,255,0.72)", fontWeight: "900", fontSize: 12 },
+  tabActive: { backgroundColor: "rgba(255,255,255,0.12)" },
+  tabText: { color: "rgba(255,255,255,0.70)", fontWeight: "900", fontSize: 12 },
   tabTextActive: { color: "white" },
 
   card: {
     borderRadius: 18,
     padding: 14,
-    backgroundColor: "rgba(255,255,255,0.04)",
+    backgroundColor: "#0b0f14",
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.10)",
   },
-  cardTitle: { color: "white", fontWeight: "900", marginBottom: 10 },
-  p: { color: "rgba(255,255,255,0.82)", lineHeight: 18, fontSize: 13 },
+  cardTitle: { color: "white", fontWeight: "900", fontSize: 14 },
 
-  kvRow: { flexDirection: "row", justifyContent: "space-between", marginTop: 10 },
-  k: { color: "#9ca3af", fontWeight: "900" },
-  v: { color: "white", fontWeight: "900" },
-
-  listRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    paddingVertical: 10,
-    borderTopWidth: 1,
-    borderTopColor: "rgba(255,255,255,0.08)",
-  },
-  rowTitle: { color: "white", fontWeight: "900" },
-  rowSub: { color: "rgba(255,255,255,0.65)", fontWeight: "800", marginTop: 3, fontSize: 12 },
-
-  badge: { paddingVertical: 8, paddingHorizontal: 10, borderRadius: 999, borderWidth: 1 },
-  badgeText: { color: "white", fontWeight: "900", fontSize: 12 },
-  badgeGood: { backgroundColor: "rgba(34,197,94,0.10)", borderColor: "rgba(34,197,94,0.22)" },
-  badgeWarn: { backgroundColor: "rgba(245,158,11,0.12)", borderColor: "rgba(245,158,11,0.24)" },
-  badgeBad: { backgroundColor: "rgba(239,68,68,0.12)", borderColor: "rgba(239,68,68,0.24)" },
-
-  smallMore: {
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    borderRadius: 999,
-    backgroundColor: "rgba(255,255,255,0.06)",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.12)",
-  },
-  smallMoreText: { color: "white", fontWeight: "900", fontSize: 12 },
-
-  moreBtn: {
-    marginTop: 12,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    alignSelf: "flex-start",
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 999,
-    backgroundColor: "rgba(0,0,0,0.55)",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.16)",
-  },
-  moreText: { color: "white", fontWeight: "900", fontSize: 12 },
-
-  profileWarn: {
-    flexDirection: "row",
-    gap: 8,
-    alignItems: "center",
-    padding: 10,
-    borderRadius: 14,
-    backgroundColor: "rgba(239,68,68,0.12)",
-    borderWidth: 1,
-    borderColor: "rgba(239,68,68,0.24)",
-    marginBottom: 10,
-  },
-  profileWarnText: { color: "white", fontWeight: "900", fontSize: 12, flex: 1 },
+  p: { color: "rgba(255,255,255,0.80)", lineHeight: 18, fontSize: 13 },
 
   progressTrack: {
     height: 10,
     borderRadius: 999,
+    marginTop: 12,
+    marginBottom: 10,
+    backgroundColor: "rgba(255,255,255,0.08)",
     overflow: "hidden",
-    backgroundColor: "rgba(255,255,255,0.07)",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.10)",
+  },
+  progressFill: { height: "100%", backgroundColor: "rgba(255,255,255,0.45)" },
+
+  row: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 6 },
+  rowLabel: { color: "rgba(255,255,255,0.62)", fontSize: 12, fontWeight: "900" },
+  rowValue: { color: "rgba(255,255,255,0.92)", fontSize: 12, fontWeight: "900" },
+
+  listRow: {
+    flexDirection: "row",
+    gap: 10,
+    alignItems: "center",
+    padding: 10,
+    borderRadius: 16,
     marginTop: 10,
-  },
-  progressFill: { height: "100%", backgroundColor: "rgba(56,189,248,0.32)" },
-
-  skelLine: {
-    height: 12,
-    width: "92%",
-    borderRadius: 999,
-    backgroundColor: "rgba(255,255,255,0.07)",
+    backgroundColor: "rgba(255,255,255,0.04)",
     borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.10)",
+    borderColor: "rgba(255,255,255,0.08)",
   },
+  rowTitle: { color: "white", fontWeight: "900", fontSize: 13 },
+  rowSub: { color: "rgba(255,255,255,0.65)", marginTop: 2, fontSize: 12, fontWeight: "800" },
 
-  footer: { marginTop: 6, paddingTop: 10 },
-  footerText: { color: "rgba(255,255,255,0.55)", fontSize: 11, lineHeight: 15 },
+  badge: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  badgeGood: { backgroundColor: "rgba(34,197,94,0.12)", borderColor: "rgba(34,197,94,0.25)" },
+  badgeWarn: { backgroundColor: "rgba(245,158,11,0.12)", borderColor: "rgba(245,158,11,0.25)" },
+  badgeBad: { backgroundColor: "rgba(239,68,68,0.12)", borderColor: "rgba(239,68,68,0.25)" },
+  badgeNeutral: { backgroundColor: "rgba(255,255,255,0.06)", borderColor: "rgba(255,255,255,0.12)" },
+  badgeText: { color: "white", fontWeight: "900", fontSize: 12 },
+
+  skel: { height: 12, borderRadius: 8, width: "88%", backgroundColor: "rgba(255,255,255,0.08)" },
+
+  nLabel: { color: "rgba(255,255,255,0.85)", fontWeight: "900", fontSize: 12 },
+  nValue: { color: "rgba(255,255,255,0.85)", fontWeight: "900", fontSize: 12 },
+  nTrack: { height: 10, borderRadius: 999, backgroundColor: "rgba(255,255,255,0.08)", overflow: "hidden" },
+  nFill: { height: "100%", backgroundColor: "rgba(255,255,255,0.45)" },
+  nHint: { color: "rgba(255,255,255,0.45)", fontSize: 11, fontWeight: "800" },
+
+  foot: { marginTop: 10, color: "rgba(255,255,255,0.45)", fontSize: 11, lineHeight: 15 },
 });

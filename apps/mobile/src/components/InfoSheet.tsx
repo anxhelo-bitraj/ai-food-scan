@@ -17,6 +17,29 @@ export default function InfoSheet({
   sources?: SheetSource[];
   onClose: () => void;
 }) {
+  const renderBody = (text: string) => {
+    const parts = String(text ?? "").split(/(https?:\/\/[^\s]+)/g);
+
+    return (
+      <Text style={styles.body}>
+        {parts.map((part, i) => {
+          const isUrl = /^https?:\/\//i.test(part);
+          if (!isUrl) return <Text key={`t-${i}`}>{part}</Text>;
+
+          return (
+            <Text
+              key={`u-${i}`}
+              style={styles.linkText}
+              onPress={() => Linking.openURL(part).catch(() => {})}
+            >
+              {part}
+            </Text>
+          );
+        })}
+      </Text>
+    );
+  };
+
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
       <Pressable style={styles.backdrop} onPress={onClose} />
@@ -33,7 +56,7 @@ export default function InfoSheet({
         </View>
 
         <ScrollView contentContainerStyle={{ padding: 16, paddingTop: 10 }}>
-          <Text style={styles.body}>{body}</Text>
+          {renderBody(body)}
 
           {sources.length ? (
             <>

@@ -6,3 +6,5 @@
 *.bak
 *.bak.*
 *.bak2
+
+cloud_pack/
