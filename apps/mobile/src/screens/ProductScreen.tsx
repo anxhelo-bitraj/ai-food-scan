@@ -9,7 +9,6 @@ import { ScanStackParamList, ProductTabKey } from "../navigation/ScanStack";
 import Chip from "../components/Chip";
 import InfoSheet, { SheetSource } from "../components/InfoSheet";
 import { upsertRoutineItem } from "../store/routineStore";
-import { getPreferences } from "../store/preferencesStore";
 import { get, postJson } from "../lib/api";
 
 type Props = NativeStackScreenProps<ScanStackParamList, "Product">;
@@ -98,6 +97,26 @@ function computeAdditivesRisk(adds: UiAdditive[]): UiAdditiveLevel {
   return "Low";
 }
 
+// --------------------------------------------------------------
+// ROUTINE SAVE HELPERS (fixes Routine Additives=0)
+// --------------------------------------------------------------
+function normalizeENumberToken(x: string): string | null {
+  if (!x) return null;
+  const s = String(x).trim().toUpperCase().replace(/\s+/g, "");
+  if (s.startsWith("E")) return s;
+  if (/^\d{3,4}[A-Z]*$/.test(s)) return `E${s}`;
+  return null;
+}
+
+function baseENumber(en: string): string {
+  const m = String(en || "").toUpperCase().match(/^E\d{3,4}/);
+  return m ? m[0] : String(en || "").toUpperCase();
+}
+
+function uniq(arr: string[]): string[] {
+  return Array.from(new Set(arr.filter(Boolean)));
+}
+
 function buildPlaceholderProduct(barcode: string): UiProduct {
   return {
     barcode,
@@ -105,14 +124,18 @@ function buildPlaceholderProduct(barcode: string): UiProduct {
     brand: "—",
     image_url: null,
     ingredients_text: null,
+
     additives: [],
     allergens: [],
     traces: [],
+
     vegan: "Unknown",
     vegetarian: "Unknown",
+
     nutriscore_grade: null,
     ecoscore_grade: null,
     ecoscore_score: null,
+
     healthScore: 60,
     off: null,
   };
@@ -128,16 +151,16 @@ function mergeApiIntoProduct(base: UiProduct, api: any): UiProduct {
     typeof api?.name === "string"
       ? api.name
       : typeof api?.product_name === "string"
-        ? api.product_name
-        : null;
+      ? api.product_name
+      : null;
   if (nm && nm.trim()) out.name = nm.trim();
 
   const br =
     typeof api?.brand === "string"
       ? api.brand
       : typeof api?.brands === "string"
-        ? api.brands
-        : null;
+      ? api.brands
+      : null;
   if (br && br.trim()) out.brand = br.trim();
 
   if (typeof api?.image_url === "string" && api.image_url.trim()) out.image_url = api.image_url.trim();
@@ -156,23 +179,21 @@ function mergeApiIntoProduct(base: UiProduct, api: any): UiProduct {
   out.vegan = toYesNoMaybe(api?.diet_flags?.vegan, maybeVegan);
   out.vegetarian = toYesNoMaybe(api?.diet_flags?.vegetarian, maybeVeg);
 
-  // additives from product endpoint (string list)
+  // additives (string list)
   const adds = asStringList(api?.additives)
     .map((x) => x.trim())
     .filter(Boolean)
     .map((x) => x.toUpperCase());
   out.additives = adds.map((code) => ({ code, name: code, level: "Unknown" }));
 
-  // allergens/traces from product endpoint (string list)
+  // allergens/traces (string list)
   const alls = asStringList(api?.allergens).map((x) => cleanTag(x)).filter(Boolean);
   const trs = asStringList(api?.traces).map((x) => cleanTag(x)).filter(Boolean);
   out.traces = trs;
 
-  out.allergens = alls.length
-    ? alls.map((a) => ({ name: titleCase(a), status: "Listed" as const }))
-    : [];
+  out.allergens = alls.length ? alls.map((a) => ({ name: titleCase(a), status: "Listed" as const })) : [];
 
-  // v1 score preference: backend returns additive_score on /products
+  // v1 score preference (backend may return additive_score on /products)
   if (typeof api?.additive_score === "number") out.healthScore = api.additive_score;
   else if (typeof api?.health_score === "number") out.healthScore = api.health_score;
 
@@ -211,7 +232,7 @@ type NutriBarProps = {
   label: string;
   value: number | null;
   unit: string;
-  bounds: [number, number, number, number, number]; // low..high thresholds (simple)
+  bounds: [number, number, number, number, number];
 };
 
 function clamp01(x: number) {
@@ -253,7 +274,10 @@ export default function ProductScreen({ route }: Props) {
   const scoreAnim = useRef(new Animated.Value(0)).current;
 
   const additivesRisk = useMemo(() => computeAdditivesRisk(product.additives), [product.additives]);
-  const allergensCount = useMemo(() => product.allergens.filter((a) => a.status === "Listed").length, [product.allergens]);
+  const allergensCount = useMemo(
+    () => product.allergens.filter((a) => a.status === "Listed").length,
+    [product.allergens]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -273,7 +297,7 @@ export default function ProductScreen({ route }: Props) {
 
         let merged = mergeApiIntoProduct(base, api);
 
-        // if we have additives, enrich from /additives/batch to get name + risk + score
+        // Enrich additives via /additives/batch
         const eNumbers = merged.additives.map((a) => a.code).filter(Boolean);
         if (eNumbers.length) {
           try {
@@ -294,7 +318,7 @@ export default function ProductScreen({ route }: Props) {
               }),
               healthScore: typeof batch?.score?.score === "number" ? batch.score.score : merged.healthScore,
             };
-          } catch (e) {
+          } catch {
             // keep base additive list if batch fails
           }
         }
@@ -330,16 +354,46 @@ export default function ProductScreen({ route }: Props) {
     Haptics.selectionAsync().catch(() => {});
   }
 
+  // ✅ FIX: save additives + e_numbers + counts into routine item
   function addToRoutine() {
     try {
+      const additives_raw = uniq(
+        (product.additives ?? [])
+          .map((a) => normalizeENumberToken(String(a?.code ?? "")))
+          .filter((x): x is string => Boolean(x))
+      );
+      const e_numbers = uniq(additives_raw.map(baseENumber));
+
+      const allergens_raw = uniq(
+        (product.allergens ?? [])
+          .filter((a) => a.status === "Listed")
+          .map((a) => String(a?.name ?? "").trim().toLowerCase())
+          .filter(Boolean)
+      );
+
       upsertRoutineItem({
         barcode: product.barcode,
         name: product.name,
         brand: product.brand,
         image_url: product.image_url ?? null,
+
+        // ✅ needed by Routine + Interaction Check
+        additives_raw,
+        e_numbers,
+
+        // optional but useful
+        allergens_raw,
+        ingredients_text: product.ingredients_text ?? null,
+
+        // badges for Routine UI
+        badges: {
+          additivesCount: e_numbers.length,
+          allergensCount: allergens_raw.length,
+        },
       } as any);
+
       Alert.alert("Added to Routine", "This item is now in your daily routine list.");
-    } catch (e) {
+    } catch {
       Alert.alert("Error", "Could not add to routine.");
     }
   }
@@ -364,7 +418,6 @@ export default function ProductScreen({ route }: Props) {
   return (
     <SafeAreaView style={styles.screen} edges={["top"]}>
       <ScrollView contentContainerStyle={{ paddingBottom: 28 }}>
-        {/* Header */}
         <View style={styles.header}>
           <View style={styles.hero}>
             <View style={styles.heroRow}>
@@ -393,12 +446,8 @@ export default function ProductScreen({ route }: Props) {
               </View>
             </View>
 
-            {/* chips */}
             <View style={styles.chipsRow}>
-              <Chip
-                label={loading ? "Eco …" : `Eco ${ecoGrade}`}
-                tone={toneForEco(ecoGrade) as any}
-              />
+              <Chip label={loading ? "Eco …" : `Eco ${ecoGrade}`} tone={toneForEco(ecoGrade) as any} />
               <Chip
                 label={loading ? "Vegan …" : `Vegan: ${product.vegan}`}
                 tone={product.vegan === "Yes" ? "good" : product.vegan === "No" ? "bad" : "neutral"}
@@ -407,13 +456,12 @@ export default function ProductScreen({ route }: Props) {
                 label={loading ? "Veg …" : `Veg: ${product.vegetarian}`}
                 tone={product.vegetarian === "Yes" ? "good" : product.vegetarian === "No" ? "bad" : "neutral"}
               />
-              <Chip
-                label={loading ? "Allergens …" : `Allergens: ${allergensCount}`}
-                tone={allergensCount ? "warn" : "good"}
-              />
+              <Chip label={loading ? "Allergens …" : `Allergens: ${allergensCount}`} tone={allergensCount ? "warn" : "good"} />
               <Chip
                 label={loading ? "Additives …" : `Additives: ${product.additives.length}`}
-                tone={additivesRisk === "High" ? "bad" : additivesRisk === "Medium" ? "warn" : additivesRisk === "Low" ? "good" : "neutral"}
+                tone={
+                  additivesRisk === "High" ? "bad" : additivesRisk === "Medium" ? "warn" : additivesRisk === "Low" ? "good" : "neutral"
+                }
               />
             </View>
 
@@ -422,16 +470,11 @@ export default function ProductScreen({ route }: Props) {
               <Text style={styles.primaryText}>Add to my Routine</Text>
             </Pressable>
 
-            <Pressable
-              style={[styles.cta, { marginTop: 10 }]}
-              onPress={() => Linking.openURL(offUrl)}
-              disabled={!product.barcode}
-            >
+            <Pressable style={[styles.cta, { marginTop: 10 }]} onPress={() => Linking.openURL(offUrl)} disabled={!product.barcode}>
               <Ionicons name="link-outline" size={18} color="rgba(255,255,255,0.9)" />
               <Text style={styles.ctaText}>Open on OpenFoodFacts</Text>
             </Pressable>
 
-            {/* Tabs */}
             <View style={styles.tabs}>
               {(["Health", "Additives", "Allergens", "Diet", "Eco"] as TabKey[]).map((k) => {
                 const active = tab === k;
@@ -445,12 +488,13 @@ export default function ProductScreen({ route }: Props) {
           </View>
         </View>
 
-        {/* Content */}
         <View style={{ paddingHorizontal: 16, paddingTop: 14, gap: 12 }}>
           {tab === "Health" ? (
             <>
               <Card title="Overview (v1)">
-                <Text style={styles.p}>This “Score” is the additives score from your backend (v1). Later we combine nutrition + additives + eco.</Text>
+                <Text style={styles.p}>
+                  This “Score” is the additives score from your backend (v1). Later we can combine nutrition + additives + eco.
+                </Text>
 
                 <View style={styles.progressTrack}>
                   <Animated.View style={[styles.progressFill, { width: scoreWidth }]} />
@@ -464,9 +508,9 @@ export default function ProductScreen({ route }: Props) {
                   <Row label="Nutri-Score" value={loading ? "…" : nutriGrade} />
                   <Row label="NOVA" value={loading ? "…" : String(nova)} />
                   <Row label="Serving size" value={loading ? "…" : String(serving)} />
-                  <Row label="Calories (per 100g/ml)" value={loading ? "…" : (kcal100 == null ? "—" : `${kcal100} kcal`)} />
-                  <Row label="Sugar (per 100g/ml)" value={loading ? "…" : (sugar100 == null ? "—" : `${sugar100} g`)} />
-                  <Row label="Salt (per 100g/ml)" value={loading ? "…" : (salt100 == null ? "—" : `${salt100} g`)} />
+                  <Row label="Calories (per 100g/ml)" value={loading ? "…" : kcal100 == null ? "—" : `${kcal100} kcal`} />
+                  <Row label="Sugar (per 100g/ml)" value={loading ? "…" : sugar100 == null ? "—" : `${sugar100} g`} />
+                  <Row label="Salt (per 100g/ml)" value={loading ? "…" : salt100 == null ? "—" : `${salt100} g`} />
                 </View>
               </Card>
 
@@ -487,121 +531,80 @@ export default function ProductScreen({ route }: Props) {
           {tab === "Additives" ? (
             <Card title="Additives found">
               {loading ? <SkeletonLines /> : null}
-
               {!loading && !product.additives.length ? <Text style={styles.p}>No additives listed.</Text> : null}
 
               {!loading
-                ? product.additives.map((a) => (
-                    <View key={a.code} style={styles.listRow}>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.rowTitle}>
-                          {a.code} • {a.name}
-                        </Text>
-                        <Text style={styles.rowSub}>Risk: {a.level}</Text>
-                      </View>
+                ? product.additives.map((a) => {
+                    const toneStyle =
+                      a.level === "High"
+                        ? styles.badgeBad
+                        : a.level === "Medium"
+                        ? styles.badgeWarn
+                        : a.level === "Low"
+                        ? styles.badgeGood
+                        : styles.badgeNeutral;
 
-                      <Pressable
-                        style={[
-                          styles.badge,
-                          a.level === "High" ? styles.badgeBad : a.level === "Medium" ? styles.badgeWarn : a.level === "Low" ? styles.badgeGood : styles.badgeNeutral,
-                        ]}
-                        onPress={() => {
-                          (async () => {
-                            const code = String(a?.code ?? "").toUpperCase().trim();
-                            const name = String(a?.name ?? code).trim() || code;
+                    return (
+                      <View key={a.code} style={styles.listRow}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.rowTitle}>
+                            {a.code} • {a.name}
+                          </Text>
+                          <Text style={styles.rowSub}>Risk: {a.level}</Text>
+                        </View>
+
+                        <Pressable
+                          style={[styles.badge, toneStyle]}
+                          onPress={async () => {
+                            const rawCode = String(a?.code ?? "").toUpperCase().trim();
+                            const code = baseENumber(rawCode); // ✅ fixes E322I -> E322
                             if (!code) return;
 
-                            setSheet({ title: `${code} • ${name}`, body: "Loading evidence and sources…" });
+                            setSheet({ title: `${rawCode} • ${a.name}`, body: "Loading evidence and sources…" });
 
                             try {
                               const detail: any = await get<any>(`/additives/${encodeURIComponent(code)}`);
                               const additive: any = detail?.additive ?? detail ?? {};
-                              const effects: any[] = Array.isArray(detail?.effects)
-                                ? detail.effects
-                                : Array.isArray(additive?.effects)
-                                  ? additive.effects
-                                  : [];
-
                               const risk = levelFromRisk(additive?.risk_level ?? detail?.risk_level ?? null);
-                              const sourceTitle = String(additive?.source_title ?? detail?.source_title ?? "").trim();
-                              const sourceUrl = String(additive?.source_url ?? detail?.source_url ?? "").trim();
-                              const sourceDate = String(additive?.source_date ?? detail?.source_date ?? "").trim();
+
+                              const bodyParts: string[] = [];
+                              bodyParts.push(`Risk level: ${risk}`);
+
+                              const note = String(additive?.note ?? detail?.note ?? "").trim();
                               const func = String(additive?.functional_class ?? detail?.functional_class ?? "").trim();
                               const adi = additive?.adi ?? detail?.adi ?? null;
-                              const note = String(additive?.note ?? detail?.note ?? "").trim();
 
-                              const groups = (x: any) => {
-                                const s = String(x ?? "").trim();
-                                if (!s || s === "no-group") return null;
-                                return s.split(",").map((t) => t.trim()).filter(Boolean).join(", ");
-                              };
+                              if (func) bodyParts.push(`Functional class: ${func}`);
+                              if (adi) bodyParts.push(`ADI: ${adi}`);
+                              if (note) bodyParts.push(`\n${note}`);
 
-                              const mean = groups(additive?.exposure_mean_gt_adi ?? detail?.exposure_mean_gt_adi);
-                              const p95 = groups(additive?.exposure_p95_gt_adi ?? detail?.exposure_p95_gt_adi);
+                              const sources: SheetSource[] = Array.isArray(detail?.sources)
+                                ? detail.sources
+                                    .map((s: any) => ({
+                                      label: String(s?.title ?? s?.label ?? s?.name ?? "Source").trim(),
+                                      url: String(s?.url ?? "").trim(),
+                                    }))
+                                    .filter((s: SheetSource) => !!s.url)
+                                : [];
 
-                              const mkEffects = () => {
-                                if (!effects.length) return null;
-                                return effects.slice(0, 8).map((x: any) => {
-                                  const endpoint = String(x?.endpoint ?? "").trim();
-                                  const effect = String(x?.effect ?? "").trim();
-                                  const species = String(x?.species ?? "").trim();
-                                  const year = x?.year ? String(x.year) : "";
-                                  const parts = [endpoint && `(${endpoint})`, effect, species && `[${species}]`, year].filter(Boolean);
-                                  return "• " + parts.join(" ");
-                                }).join("\n");
-                              };
-
-                              const effectsText = mkEffects();
-                              const exposureLine =
-                                mean || p95
-                                  ? `Exposure above guidance levels reported for: ${[
-                                      mean ? "mean: " + mean : null,
-                                      p95 ? "P95: " + p95 : null,
-                                    ].filter(Boolean).join(" • ")}`
-                                  : null;
-
-                              const whatWeKnow =
-                                effectsText ??
-                                exposureLine ??
-                                (note || "No structured effect rows in our DB yet for this additive. Use sources below for full context.");
-
-                              const fsaSlug = "e-" + code.slice(1).toLowerCase();
-                              const fsaUrl = `https://data.food.gov.uk/regulated-products/food_authorisations/${fsaSlug}`;
-                              const fsaListUrl = "https://www.food.gov.uk/business-guidance/approved-additives-and-e-numbers";
-                              const offAddUrl = `https://world.openfoodfacts.org/additive/en:${code.toLowerCase()}`;
-
-                              const body =
-                                `Risk level: ${risk}\n` +
-                                (func ? `Functional class: ${func}\n` : "") +
-                                (adi ? `ADI: ${adi}\n` : "") +
-                                `\nWhat we know so far:\n${whatWeKnow}\n\n` +
-                                `Sources:\n` +
-                                `• UK FSA register: ${fsaUrl}\n` +
-                                `• Open Food Facts additive page: ${offAddUrl}\n` +
-                                (sourceUrl ? `• ${sourceTitle || "EFSA/Scientific source"}${sourceDate ? " (" + sourceDate + ")" : ""}: ${sourceUrl}\n` : "") +
-                                `• UK FSA approved additives list: ${fsaListUrl}\n\n` +
-                                `Note: Not medical advice. Check labels and consult professionals.`;
-
-                              const sources: SheetSource[] = [];
-                              if (sourceUrl) sources.push({ label: sourceTitle || "EFSA/Scientific source", url: sourceUrl });
-                              sources.push({ label: "UK FSA register", url: fsaUrl });
-                              sources.push({ label: "Open Food Facts additive page", url: offAddUrl });
-                              sources.push({ label: "UK FSA approved additives list", url: fsaListUrl });
-
-                              setSheet({ title: `${code} • ${name}`, body, sources });
+                              setSheet({
+                                title: `${rawCode} • ${String(additive?.name ?? a.name ?? rawCode)}`,
+                                body: bodyParts.join("\n"),
+                                sources,
+                              });
                             } catch (e: any) {
                               setSheet({
-                                title: `${a.code} • ${a.name}`,
-                                body: `Could not load additive details.\n\nTry again. Error: ${String(e?.message ?? e)}`,
+                                title: `${rawCode} • ${a.name}`,
+                                body: `Could not load additive details.\n\nError: ${String(e?.message ?? e)}`,
                               });
                             }
-                          })();
-                        }}
-                      >
-                        <Text style={styles.badgeText}>More</Text>
-                      </Pressable>
-                    </View>
-                  ))
+                          }}
+                        >
+                          <Text style={styles.badgeText}>More</Text>
+                        </Pressable>
+                      </View>
+                    );
+                  })
                 : null}
             </Card>
           ) : null}
@@ -612,7 +615,13 @@ export default function ProductScreen({ route }: Props) {
               {!loading ? (
                 <>
                   <Text style={styles.p}>
-                    Allergens listed: {allergensCount ? product.allergens.filter((a) => a.status === "Listed").map((a) => a.name).join(", ") : "None listed."}
+                    Allergens listed:{" "}
+                    {allergensCount
+                      ? product.allergens
+                          .filter((a) => a.status === "Listed")
+                          .map((a) => a.name)
+                          .join(", ")
+                      : "No allergens listed."}
                   </Text>
                   <Text style={[styles.p, { marginTop: 8 }]}>
                     Traces: {product.traces.length ? product.traces.map((t) => titleCase(cleanTag(t))).join(", ") : "No traces listed."}
@@ -644,10 +653,7 @@ export default function ProductScreen({ route }: Props) {
                 <>
                   <Row label="Eco-Score grade" value={String(product.ecoscore_grade ?? "—")} />
                   <Row label="Eco-Score score" value={product.ecoscore_score == null ? "—" : String(product.ecoscore_score)} />
-                  <Pressable
-                    style={[styles.cta, { marginTop: 10 }]}
-                    onPress={() => Linking.openURL(offUrl)}
-                  >
+                  <Pressable style={[styles.cta, { marginTop: 10 }]} onPress={() => Linking.openURL(offUrl)}>
                     <Ionicons name="leaf-outline" size={18} color="rgba(255,255,255,0.9)" />
                     <Text style={styles.ctaText}>Open OFF eco details</Text>
                   </Pressable>
@@ -656,9 +662,7 @@ export default function ProductScreen({ route }: Props) {
             </Card>
           ) : null}
 
-          <Text style={styles.foot}>
-            Disclaimer: Not medical advice. Always check labels and consult professionals for health decisions.
-          </Text>
+          <Text style={styles.foot}>Disclaimer: Not medical advice. Always check labels and consult professionals for health decisions.</Text>
         </View>
       </ScrollView>
 
@@ -685,6 +689,7 @@ const styles = StyleSheet.create({
     borderColor: "rgba(255,255,255,0.10)",
   },
   heroRow: { flexDirection: "row", gap: 12, alignItems: "center" },
+
   imgWrap: { width: 62, height: 62, borderRadius: 16, overflow: "hidden", backgroundColor: "rgba(255,255,255,0.06)" },
   img: { width: "100%", height: "100%" },
 
@@ -692,17 +697,17 @@ const styles = StyleSheet.create({
   subtitle: { color: "rgba(255,255,255,0.60)", marginTop: 2, fontSize: 12 },
 
   scorePill: {
-    width: 62,
-    height: 62,
-    borderRadius: 16,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(255,255,255,0.06)",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 14,
+    backgroundColor: "rgba(255,255,255,0.08)",
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.10)",
+    alignItems: "center",
+    minWidth: 56,
   },
-  scoreLabel: { color: "rgba(255,255,255,0.60)", fontSize: 11, fontWeight: "800" },
-  scoreValue: { color: "white", fontSize: 18, fontWeight: "900", marginTop: 2 },
+  scoreLabel: { color: "rgba(255,255,255,0.65)", fontSize: 10, fontWeight: "900" },
+  scoreValue: { color: "white", fontSize: 14, fontWeight: "900", marginTop: 2 },
 
   chipsRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 12 },
 
