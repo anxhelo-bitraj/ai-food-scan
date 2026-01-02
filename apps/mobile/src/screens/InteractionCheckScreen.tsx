@@ -1,427 +1,473 @@
-import React, { useMemo, useState, useEffect } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { Alert, Linking, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
+import { useFocusEffect } from "@react-navigation/native";
 
 import InfoSheet from "../components/InfoSheet";
-import { Frequency, getRoutineItems, setRoutineFrequency } from "../store/routineStore";
-import { post } from "../lib/api";
+import { getRoutineItems } from "../store/routineStore";
+import { postJson } from "../lib/api";
 
-type Severity = "High" | "Medium" | "Low";
+type SheetSource = { label: string; url?: string };
+type SheetState = { visible: boolean; title: string; body: string; sources?: SheetSource[] };
 
-type Interaction = {
-  id: string;
-  title: string;
-  severity: Severity;
-  confidence: "Low" | "Medium" | "High";
-  why: string;
-  whatToDo: string;
-  sources: { label: string; url?: string }[];
+type ApiSource = { source_id: string; title?: string; url?: string; year?: string; notes?: string };
+type ApiAdditive = {
+  e_number: string;
+  name?: string;
+  group?: string;
+  basic_risk_level?: string;
+  adi_mg_per_kg_bw_day?: number | null;
+  simple_user_message?: string;
+  source_url?: string;
 };
 
-function sevTone(s: Severity) {
-  if (s === "High") return styles.badgeBad;
-  if (s === "Medium") return styles.badgeWarn;
-  return styles.badgeGood;
+type ApiMatch = {
+  combo_id: string;
+  severity: string; // high|medium|low|info
+  risk_weight_0to3: number;
+  matched_e_numbers: string[];
+  health_outcome_short?: string;
+  context?: string;
+  sources?: ApiSource[];
+};
+
+type ApiResp = {
+  inputs: string[];
+  additives?: ApiAdditive[];
+  summary: { score: number; grade: string; matches: number; method: string };
+  matches: ApiMatch[];
+};
+
+function normE(x: any): string {
+  const s = String(x ?? "").trim().toUpperCase();
+  if (!s) return "";
+  if (s[0] >= "0" && s[0] <= "9") return `E${s}`;
+  // allow "E-102" or "E 102"
+  const m = s.match(/^E[\s\-]?(\d+)([A-Z]+)?$/);
+  if (m) return `E${m[1]}${m[2] ?? ""}`;
+  return s.startsWith("E") ? s : "";
 }
 
-function weight(freq: Frequency) {
-  return freq === "Daily" ? 1.0 : freq === "Weekly" ? 0.6 : 0.3;
+// Expands E322I -> [E322I, E322]
+function expandE(e: string): string[] {
+  const out = new Set<string>();
+  const n = normE(e);
+  if (!n) return [];
+  out.add(n);
+  const m = n.match(/^E(\d+)([A-Z]+)?$/);
+  if (m) out.add(`E${m[1]}`);
+  return Array.from(out);
 }
 
-function nextFreq(f: Frequency): Frequency {
-  return f === "Daily" ? "Weekly" : f === "Weekly" ? "Rare" : "Daily";
-}
+function extractENumbers(items: any[]): string[] {
+  const out = new Set<string>();
 
-function summarize(list: Interaction[]) {
-  const out = { High: 0, Medium: 0, Low: 0 };
-  for (const i of list) out[i.severity]++;
-  return out;
-}
+  const addToken = (t: any) => {
+    const n = normE(t);
+    if (!n) return;
+    for (const x of expandE(n)) out.add(x);
+  };
 
-function makePlaceholderInteractions(items: ReturnType<typeof getRoutineItems>): Interaction[] {
-  if (items.length < 2) return [];
+  for (const it of items || []) {
+    const candidates: any[] = [];
+    if (Array.isArray(it?.additives)) candidates.push(...it.additives);
+    if (Array.isArray(it?.off?.additives)) candidates.push(...it.off.additives);
+    if (Array.isArray(it?.product?.additives)) candidates.push(...it.product.additives);
+    if (Array.isArray(it?.e_numbers)) candidates.push(...it.e_numbers);
+    if (Array.isArray(it?.additives_e_numbers)) candidates.push(...it.additives_e_numbers);
 
-  const a = items[0];
-  const b = items[1];
-
-  const w = (weight(a.frequency) + weight(b.frequency)) / 2;
-
-  const severity: Severity =
-    a.badges.additivesRisk === "High" || b.badges.additivesRisk === "High"
-      ? w > 0.7
-        ? "High"
-        : "Medium"
-      : a.badges.additivesRisk === "Medium" || b.badges.additivesRisk === "Medium"
-      ? w > 0.7
-        ? "Medium"
-        : "Low"
-      : "Low";
-
-  const confidence: Interaction["confidence"] = w > 0.8 ? "Medium" : w > 0.5 ? "Low" : "Low";
-
-  const base: Interaction[] = [
-    {
-      id: `pair-${a.id}-${b.id}`,
-      title: `${a.name} + ${b.name}`,
-      severity,
-      confidence,
-      why:
-        "Placeholder: risk may increase when certain additives are consumed together regularly. " +
-        "This demo uses your Routine frequency to adjust perceived exposure (Daily > Weekly > Rare).",
-      whatToDo:
-        "Placeholder: reduce frequency, swap one item, or exclude one item below and compare results.",
-      sources: [{ label: "Source placeholder", url: "https://example.com" }],
-    },
-  ];
-
-  if (items.length >= 3) {
-    const c = items[2];
-    const w3 = (weight(a.frequency) + weight(b.frequency) + weight(c.frequency)) / 3;
-    base.push({
-      id: `tri-${a.id}-${b.id}-${c.id}`,
-      title: `${a.name} + ${b.name} + ${c.name}`,
-      severity: w3 > 0.75 ? "High" : "Medium",
-      confidence: "Low",
-      why: "Placeholder: combined exposure can matter more than single-product exposure.",
-      whatToDo: "Placeholder: try excluding one item using the toggles and compare results.",
-      sources: [{ label: "Source placeholder", url: "https://example.com" }],
-    });
+    for (const c of candidates) addToken(c);
   }
 
-  return base;
+  return Array.from(out);
+}
+
+function severityLabel(x: string) {
+  const s = String(x || "").toLowerCase();
+  if (s === "high") return "High";
+  if (s === "medium") return "Medium";
+  if (s === "low") return "Low";
+  return "Info";
+}
+
+function severityIcon(x: string) {
+  const s = String(x || "").toLowerCase();
+  if (s === "high") return "warning-outline";
+  if (s === "medium") return "alert-circle-outline";
+  if (s === "low") return "information-circle-outline";
+  return "help-circle-outline";
+}
+
+function scoreToHint(score?: number) {
+  if (score == null) return "";
+  if (score >= 85) return "Looks OK in current dataset";
+  if (score >= 70) return "Some caution";
+  if (score >= 55) return "Notable signal(s)";
+  return "Higher concern signals";
+}
+
+function gradeToColor(grade?: string) {
+  const g = String(grade || "").toUpperCase();
+  if (g === "A") return "#22c55e";
+  if (g === "B") return "#84cc16";
+  if (g === "C") return "#f59e0b";
+  if (g === "D") return "#fb7185";
+  if (g === "E") return "#ef4444";
+  return "#9ca3af";
+}
+
+function openUrl(url?: string) {
+  if (!url) return;
+  Linking.openURL(url).catch(() => {});
 }
 
 export default function InteractionCheckScreen() {
-  const [items, setItems] = useState(() => getRoutineItems());
-  const [excluded, setExcluded] = useState<Record<string, boolean>>({});
-  const [open, setOpen] = useState<Interaction | null>(null);
+  const [items, setItems] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [resp, setResp] = useState<ApiResp | null>(null);
+  const [err, setErr] = useState<string>("");
 
-  const includedItems = useMemo(() => items.filter((it) => !excluded[it.id]), [items, excluded]);
-  const excludedCount = useMemo(() => Object.values(excluded).filter(Boolean).length, [excluded]);
+  const [sheet, setSheet] = useState<SheetState>({
+    visible: false,
+    title: "",
+    body: "",
+    sources: [],
+  });
 
-  // Interactions from API (backend)
-  const [apiLoading, setApiLoading] = useState(false);
-  const [apiError, setApiError] = useState<string | null>(null);
+  const eNumbers = useMemo(() => extractENumbers(items), [items]);
+  const eKey = useMemo(() => eNumbers.join(","), [eNumbers]);
+  const canRun = eNumbers.length >= 2;
 
-  const [interactionsFull, setInteractionsFull] = useState<any[]>([]);
-  const [interactionsNow, setInteractionsNow] = useState<any[]>([]);
+  const showSheet = (title: string, body: string, sources: SheetSource[] = []) => {
+    setSheet({ visible: true, title, body, sources });
+  };
 
-  // Full routine interactions (for comparison)
-  useEffect(() => {
-    let cancelled = false;
+  const loadRoutine = useCallback(async () => {
+    try {
+      // works whether getRoutineItems returns a value or a promise
+      const v = await Promise.resolve(getRoutineItems() as any);
+      setItems(Array.isArray(v) ? v : []);
+    } catch {
+      setItems([]);
+    }
+  }, []);
 
-    if (items.length < 2) {
-      setInteractionsFull([]);
+  const runCheck = async () => {
+    if (!canRun) {
+      setResp(null);
+      setErr("");
       return;
     }
 
-    const t = setTimeout(async () => {
-      try {
-        const resp = await post<any>("/interactions/check", {
-          items: items.map((it: any) => it.name),
-        });
-        if (cancelled) return;
+    setLoading(true);
+    setErr("");
+    try {
+      const r = await postJson<ApiResp>("/interactions/check", { e_numbers: eNumbers });
+      setResp(r);
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      setErr(msg);
+      setResp(null);
+      Alert.alert("Interaction check failed", msg);
+    } finally {
+      setLoading(false);
+    }
+  };
 
-        setInteractionsFull(
-          (resp?.matches ?? []).map((m: any) => ({
-            id: String(m.id),
-            title: m.title,
-            severity: m.severity,
-            confidence: m.confidence,
-            why: m.why ?? "",
-            whatToDo: m.what_to_do ?? "",
-            sources: (m.sources ?? []).map((s: any) => ({ label: s.label, url: s.url })),
-          }))
-        );
-      } catch {
-        if (!cancelled) setInteractionsFull([]);
-      }
-    }, 250);
-
-    return () => {
-      cancelled = true;
-      clearTimeout(t);
-    };
-  }, [items]);
-
-  // Included (what-if) interactions (this is what user is currently testing)
+  // Load routine once on mount
   useEffect(() => {
-    let cancelled = false;
+    loadRoutine();
+  }, [loadRoutine]);
 
-    if (includedItems.length < 2) {
-      setInteractionsNow([]);
-      setApiLoading(false);
-      setApiError(null);
+  // Reload when screen gains focus (after adding/removing routine items)
+  useFocusEffect(
+    useCallback(() => {
+      loadRoutine();
+      return () => {};
+    }, [loadRoutine])
+  );
+
+  // Auto-run when routine additives change (debounced)
+  useEffect(() => {
+    if (!canRun) {
+      setResp(null);
       return;
     }
+    const t = setTimeout(() => {
+      runCheck();
+    }, 350);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eKey]);
 
-    const t = setTimeout(async () => {
-      try {
-        setApiLoading(true);
-        setApiError(null);
+  const summaryLine = useMemo(() => {
+    if (loading) return "Checking your routine for known risky additive combinations…";
+    if (err) return "Could not run interaction check. Tap for details.";
+    if (!canRun) return "Add at least 2 additives in your routine (from one or more products) to run the check.";
+    if (!resp) return "Ready to check your routine.";
+    if (!resp.matches?.length) return "No matches found in your current evidence dataset.";
+    return `Found ${resp.matches.length} interaction signal(s) in your evidence dataset.`;
+  }, [loading, err, resp, canRun]);
 
-        const resp = await post<any>("/interactions/check", {
-          items: includedItems.map((it: any) => it.name),
-        });
+  const openMatch = (m: ApiMatch) => {
+    const srcs: SheetSource[] = (m.sources || [])
+      .filter((s) => s?.url)
+      .map((s) => ({
+        label: `${s.title}${s.year ? ` (${s.year})` : ""}`,
+        url: s.url,
+      }));
 
-        if (cancelled) return;
+    const body =
+      `Severity: ${severityLabel(m.severity)}\n` +
+      `Score impact weight: ${m.risk_weight_0to3} (0–3)\n` +
+      `Matched additives: ${(m.matched_e_numbers || []).join(" + ") || "—"}\n` +
+      (m.context ? `Context: ${m.context}\n` : "") +
+      `\nWhat studies suggest:\n${m.health_outcome_short}\n\n` +
+      `Notes:\n` +
+      `• This is evidence-based *signal* from your imported dataset, not medical advice.\n` +
+      `• Risk depends on dose, frequency, and individual factors (children, pregnancy, conditions, meds).\n`;
 
-        setInteractionsNow(
-          (resp?.matches ?? []).map((m: any) => ({
-            id: String(m.id),
-            title: m.title,
-            severity: m.severity,
-            confidence: m.confidence,
-            why: m.why ?? "",
-            whatToDo: m.what_to_do ?? "",
-            sources: (m.sources ?? []).map((s: any) => ({ label: s.label, url: s.url })),
-          }))
-        );
-      } catch (e: any) {
-        if (cancelled) return;
-        setInteractionsNow([]);
-        setApiError(e?.message ?? "Failed to reach API");
-      } finally {
-        if (!cancelled) setApiLoading(false);
-      }
-    }, 250);
+    showSheet(m.combo_id, body, srcs);
+  };
 
-    return () => {
-      cancelled = true;
-      clearTimeout(t);
-    };
-  }, [includedItems]);
+  const openSummary = () => {
+    if (!resp) return;
+    const body =
+      `Inputs (unique additives): ${resp.inputs?.join(", ") || "—"}\n` +
+      `Matches: ${resp.summary?.matches ?? 0}\n` +
+      `Score: ${resp.summary?.score ?? "—"}\n` +
+      `Grade: ${resp.summary?.grade ?? "—"}\n\n` +
+      `Method:\n${resp.summary?.method ?? "—"}\n\n` +
+      `Interpretation:\n` +
+      `• Higher score/grade = fewer (or lower-weight) risky combinations found in your dataset.\n` +
+      `• A “no matches” result means “not found in current dataset”, not “proven safe”.\n`;
+    showSheet("Routine Check Summary", body, []);
+  };
 
-    // interactionsNow is loaded from the API above
+  const openAdditive = (a: ApiAdditive) => {
+    const body =
+      `${a.e_number}${a.name ? ` — ${a.name}` : ""}\n` +
+      (a.group ? `Group: ${a.group}\n` : "") +
+      (a.basic_risk_level ? `Base risk: ${a.basic_risk_level}\n` : "") +
+      (a.adi_mg_per_kg_bw_day != null ? `ADI: ${a.adi_mg_per_kg_bw_day} mg/kg bw/day\n` : "") +
+      (a.simple_user_message ? `\n${a.simple_user_message}\n` : "");
+    const srcs: SheetSource[] = a.source_url ? [{ label: "Primary source", url: a.source_url }] : [];
+    showSheet(`Additive ${a.e_number}`, body, srcs);
+  };
 
-
-  const fullSum = useMemo(() => summarize(interactionsFull), [interactionsFull]);
-  const nowSum = useMemo(() => summarize(interactionsNow), [interactionsNow]);
-
-  const delta = useMemo(() => {
-    return {
-      High: nowSum.High - fullSum.High,
-      Medium: nowSum.Medium - fullSum.Medium,
-      Low: nowSum.Low - fullSum.Low,
-    };
-  }, [fullSum, nowSum]);
-
-  const grouped = useMemo(() => {
-    const g: Record<Severity, Interaction[]> = { High: [], Medium: [], Low: [] };
-    for (const it of interactionsNow) g[it.severity].push(it);
-    return g;
-  }, [interactionsNow]);
+  const score = resp?.summary?.score;
+  const grade = resp?.summary?.grade;
+  const gradeColor = gradeToColor(grade);
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={{ padding: 16, paddingBottom: 26, gap: 12 }}>
-      <View style={styles.card}>
-        <Text style={styles.title}>Interaction Check</Text>
-        <Text style={styles.p}>
-          Toggle items to run “what-if” analysis. Frequency affects exposure weighting (placeholder).
-        </Text>
+    <View style={styles.root}>
+      <InfoSheet
+        visible={sheet.visible}
+        title={sheet.title}
+        body={sheet.body}
+        sources={sheet.sources}
+        onClose={() => setSheet((s) => ({ ...s, visible: false }))}
+      />
 
-        <View style={styles.row}>
-          {apiLoading ? <Text style={styles.muted}>Checking interactions…</Text> : null}
-      {apiError ? <Text style={styles.error}>{apiError}</Text> : null}
-      <Text style={styles.muted}>Included: {includedItems.length}/{items.length}</Text>
-
-          <View style={{ flexDirection: "row", gap: 10 }}>
-            <Pressable style={styles.smallBtn} onPress={() => setExcluded({})}>
-              <Text style={styles.smallBtnText}>Include all</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.smallBtn}
-              onPress={() => {
-                const all: Record<string, boolean> = {};
-                items.forEach((i) => (all[i.id] = true));
-                setExcluded(all);
-              }}
-            >
-              <Text style={styles.smallBtnText}>Exclude all</Text>
-            </Pressable>
-          </View>
+      <View style={styles.header}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.title}>Routine Check</Text>
+          <Text style={styles.subtitle}>Cross-check additives across multiple products using your imported studies.</Text>
         </View>
 
-        {excludedCount > 0 ? (
-          <Text style={styles.deltaText}>
-            Compared to full routine: High {delta.High >= 0 ? "+" : ""}{delta.High}, Medium {delta.Medium >= 0 ? "+" : ""}{delta.Medium}, Low {delta.Low >= 0 ? "+" : ""}{delta.Low}
-          </Text>
-        ) : null}
+        <Pressable style={styles.refreshBtn} onPress={loadRoutine}>
+          <Ionicons name="refresh-outline" size={18} color="#93c5fd" />
+          <Text style={styles.refreshText}>Refresh</Text>
+        </Pressable>
       </View>
 
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Items considered</Text>
-
-        {items.length === 0 ? (
-          <Text style={styles.p}>No routine items yet. Add products from the Product page.</Text>
-        ) : (
-          items.map((it) => {
-            const off = !!excluded[it.id];
-            return (
-              <View key={it.id} style={[styles.itemRow, off ? styles.itemRowOff : null]}>
-                <Pressable style={{ flex: 1 }} onPress={() => setExcluded((p) => ({ ...p, [it.id]: !p[it.id] }))}>
-                  <Text style={styles.itemTitle} numberOfLines={1}>{it.name}</Text>
-                  <Text style={styles.itemSub} numberOfLines={1}>
-                    {it.brand} • {it.badges.additivesRisk} additives risk
-                  </Text>
-                </Pressable>
-
-                <Pressable
-                  style={styles.freqPill}
-                  onPress={() => {
-                    const next = nextFreq(it.frequency);
-                    setRoutineFrequency(it.id, next);
-                    setItems(getRoutineItems());
-                  }}
-                >
-                  <Text style={styles.freqText}>{it.frequency}</Text>
-                </Pressable>
-
-                <Pressable
-                  style={[styles.togglePill, off ? styles.toggleOff : styles.toggleOn]}
-                  onPress={() => setExcluded((p) => ({ ...p, [it.id]: !p[it.id] }))}
-                >
-                  <Ionicons name={off ? "eye-off-outline" : "eye-outline"} size={16} color="white" />
-                </Pressable>
+      <ScrollView contentContainerStyle={styles.content}>
+        <Pressable style={styles.summaryCard} onPress={resp ? openSummary : undefined}>
+          <View style={styles.summaryTop}>
+            <View style={styles.badgeRow}>
+              <View style={[styles.gradePill, { borderColor: gradeColor }]}>
+                <Text style={[styles.gradeText, { color: gradeColor }]}>{grade ?? "—"}</Text>
               </View>
-            );
-          })
+              <Text style={styles.scoreText}>{score ?? "—"}</Text>
+            </View>
+
+            <Text style={styles.hintText}>{scoreToHint(score)}</Text>
+          </View>
+
+          <Text style={styles.summaryLine}>{summaryLine}</Text>
+        </Pressable>
+
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Your additives (unique)</Text>
+          <Text style={styles.sectionSub}>{eNumbers.length ? eNumbers.join(", ") : "—"}</Text>
+        </View>
+
+        {!!resp?.additives?.length && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Additives in routine</Text>
+            <View style={{ gap: 10 }}>
+              {resp.additives.map((a) => (
+                <Pressable key={a.e_number} style={styles.additiveCard} onPress={() => openAdditive(a)}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.additiveTitle}>
+                      {a.e_number}
+                      {a.name ? ` — ${a.name}` : ""}
+                    </Text>
+                    <Text style={styles.additiveMeta}>
+                      {(a.group ? a.group : "unknown group") + (a.basic_risk_level ? ` • ${a.basic_risk_level}` : "")}
+                    </Text>
+                    {!!a.simple_user_message && <Text style={styles.additiveBody}>{a.simple_user_message}</Text>}
+                  </View>
+                  <Ionicons name="chevron-forward-outline" size={18} color="#9ca3af" />
+                </Pressable>
+              ))}
+            </View>
+          </View>
         )}
-      </View>
 
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Results</Text>
+        <View style={styles.section}>
+          <View style={styles.sectionHeadRow}>
+            <Text style={styles.sectionTitle}>Evidence matches</Text>
+            <Text style={styles.sectionSub}>{resp?.matches?.length ?? 0}</Text>
+          </View>
 
-        {includedItems.length < 2 ? (
-          <Text style={styles.p}>Add at least 2 routine items (and include them) to see interaction results.</Text>
-        ) : interactionsNow.length === 0 ? (
-          <Text style={styles.p}>No interactions detected (placeholder).</Text>
-        ) : (
-          <>
-            {(["High", "Medium", "Low"] as Severity[]).map((sev) =>
-              grouped[sev].length ? (
-                <View key={sev} style={{ marginTop: 10 }}>
-                  <Text style={styles.groupTitle}>{sev} severity</Text>
+          {!resp?.matches?.length ? (
+            <Text style={styles.emptyText}>
+              {canRun ? "No risky combinations found in your current evidence dataset." : "Add more items/additives to run the check."}
+            </Text>
+          ) : (
+            <View style={{ gap: 10 }}>
+              {resp.matches.map((m) => (
+                <Pressable key={m.combo_id} style={styles.matchCard} onPress={() => openMatch(m)}>
+                  <View style={styles.matchLeft}>
+                    <Ionicons name={severityIcon(m.severity) as any} size={18} color="#e5e7eb" />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.matchTitle}>{m.health_outcome_short || m.combo_id}</Text>
+                    <Text style={styles.matchMeta}>
+                      {severityLabel(m.severity)} • weight {m.risk_weight_0to3} • {(m.matched_e_numbers || []).join(" + ")}
+                    </Text>
 
-                  {grouped[sev].map((r) => (
-                    <Pressable key={r.id} style={styles.resultRow} onPress={() => setOpen(r)}>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.resultTitle} numberOfLines={2}>{r.title}</Text>
-                        <Text style={styles.resultSub}>Confidence: {r.confidence}</Text>
+                    {!!m.sources?.length && (
+                      <View style={{ marginTop: 6, gap: 6 }}>
+                        {m.sources
+                          .filter((s) => s?.url)
+                          .slice(0, 2)
+                          .map((s) => (
+                            <Pressable key={s.source_id} style={styles.sourceRow} onPress={() => openUrl(s.url)}>
+                              <Ionicons name="link-outline" size={14} color="#93c5fd" />
+                              <Text style={styles.sourceText} numberOfLines={1}>
+                                {s.title}
+                                {s.year ? ` (${s.year})` : ""}
+                              </Text>
+                            </Pressable>
+                          ))}
                       </View>
+                    )}
+                  </View>
 
-                      <View style={[styles.badge, sevTone(r.severity)]}>
-                        <Text style={styles.badgeText}>{r.severity}</Text>
-                      </View>
-
-                      <Ionicons name="chevron-forward" size={18} color="rgba(255,255,255,0.65)" />
-                    </Pressable>
-                  ))}
-                </View>
-              ) : null
-            )}
-          </>
-        )}
-      </View>
-
-      <InfoSheet
-        visible={!!open}
-        title={open?.title ?? ""}
-        body={
-          open
-            ? `Severity: ${open.severity}\nConfidence: ${open.confidence}\n\nWhy:\n${open.why}\n\nWhat to do:\n${open.whatToDo}`
-            : ""
-        }
-        sources={open?.sources ?? []}
-        onClose={() => setOpen(null)}
-      />
-    </ScrollView>
+                  <Ionicons name="chevron-forward-outline" size={18} color="#9ca3af" />
+                </Pressable>
+              ))}
+            </View>
+          )}
+        </View>
+      </ScrollView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#0b0f14" },
+  root: { flex: 1, backgroundColor: "#0b0f14" },
 
-  card: {
-    borderRadius: 18,
-    padding: 14,
-    backgroundColor: "rgba(255,255,255,0.04)",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.10)",
-  },
-  title: { color: "white", fontWeight: "900", fontSize: 18 },
-  cardTitle: { color: "white", fontWeight: "900" },
-  p: { marginTop: 8, color: "rgba(255,255,255,0.78)", lineHeight: 18, fontSize: 13 },
-  error: { color: "#ef4444", fontSize: 12, marginTop: 8 },
-  muted: { color: "#9ca3af", fontWeight: "900" },
-
-  row: { marginTop: 12, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 },
-
-  smallBtn: {
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    borderRadius: 999,
-    backgroundColor: "rgba(0,0,0,0.55)",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.16)",
-  },
-  smallBtnText: { color: "white", fontWeight: "900", fontSize: 12 },
-
-  deltaText: { marginTop: 10, color: "rgba(255,255,255,0.70)", fontWeight: "900", fontSize: 12 },
-
-  itemRow: {
-    marginTop: 10,
+  header: {
+    paddingHorizontal: 16,
+    paddingTop: 14,
+    paddingBottom: 10,
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
-    padding: 12,
-    borderRadius: 16,
-    backgroundColor: "rgba(255,255,255,0.04)",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.10)",
+    gap: 12,
   },
-  itemRowOff: { opacity: 0.55 },
-  itemTitle: { color: "white", fontWeight: "900" },
-  itemSub: { marginTop: 4, color: "rgba(255,255,255,0.65)", fontWeight: "800", fontSize: 12 },
+  title: { color: "white", fontSize: 22, fontWeight: "700" },
+  subtitle: { color: "#9ca3af", marginTop: 4 },
 
-  freqPill: {
-    paddingVertical: 8,
+  refreshBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderWidth: 1,
+    borderColor: "#1f2937",
+    backgroundColor: "#0f1622",
     paddingHorizontal: 10,
+    paddingVertical: 8,
     borderRadius: 999,
-    backgroundColor: "rgba(0,0,0,0.55)",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.16)",
   },
-  freqText: { color: "white", fontWeight: "900", fontSize: 12 },
+  refreshText: { color: "#93c5fd", fontWeight: "600" },
 
-  togglePill: {
-    width: 44,
+  content: { padding: 16, paddingBottom: 28, gap: 14 },
+
+  summaryCard: {
+    borderWidth: 1,
+    borderColor: "#1f2937",
+    backgroundColor: "#0f1622",
+    borderRadius: 16,
+    padding: 14,
+  },
+  summaryTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  badgeRow: { flexDirection: "row", alignItems: "baseline", gap: 10 },
+  gradePill: { borderWidth: 1, paddingHorizontal: 10, paddingVertical: 4, borderRadius: 999 },
+  gradeText: { fontSize: 16, fontWeight: "800" },
+  scoreText: { color: "white", fontSize: 28, fontWeight: "800" },
+  hintText: { color: "#9ca3af", fontWeight: "600" },
+  summaryLine: { color: "#e5e7eb", marginTop: 10, lineHeight: 20 },
+
+  section: {
+    borderWidth: 1,
+    borderColor: "#111827",
+    backgroundColor: "#0b0f14",
+    borderRadius: 14,
+    padding: 12,
+  },
+  sectionHeadRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  sectionTitle: { color: "#e5e7eb", fontSize: 16, fontWeight: "800" },
+  sectionSub: { color: "#9ca3af", marginTop: 6 },
+  emptyText: { color: "#9ca3af", marginTop: 8, lineHeight: 20 },
+
+  additiveCard: {
+    borderWidth: 1,
+    borderColor: "#1f2937",
+    backgroundColor: "#0f1622",
+    padding: 12,
+    borderRadius: 14,
+    flexDirection: "row",
+    gap: 10,
+    alignItems: "center",
+  },
+  additiveTitle: { color: "white", fontWeight: "800" },
+  additiveMeta: { color: "#9ca3af", marginTop: 4 },
+  additiveBody: { color: "#e5e7eb", marginTop: 6, lineHeight: 18 },
+
+  matchCard: {
+    borderWidth: 1,
+    borderColor: "#1f2937",
+    backgroundColor: "#0f1622",
+    padding: 12,
+    borderRadius: 14,
+    flexDirection: "row",
+    gap: 10,
+    alignItems: "center",
+  },
+  matchLeft: {
+    width: 34,
     height: 34,
-    borderRadius: 999,
+    borderRadius: 10,
+    backgroundColor: "#111827",
     alignItems: "center",
     justifyContent: "center",
-    borderWidth: 1,
   },
-  toggleOn: { backgroundColor: "rgba(34,197,94,0.16)", borderColor: "rgba(34,197,94,0.26)" },
-  toggleOff: { backgroundColor: "rgba(239,68,68,0.14)", borderColor: "rgba(239,68,68,0.24)" },
+  matchTitle: { color: "white", fontWeight: "800", lineHeight: 18 },
+  matchMeta: { color: "#9ca3af", marginTop: 6 },
 
-  groupTitle: { color: "#9ca3af", fontWeight: "900", marginBottom: 6 },
-
-  resultRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    paddingVertical: 12,
-    borderTopWidth: 1,
-    borderTopColor: "rgba(255,255,255,0.08)",
-  },
-  resultTitle: { color: "white", fontWeight: "900" },
-  resultSub: { marginTop: 4, color: "rgba(255,255,255,0.65)", fontWeight: "800", fontSize: 12 },
-
-  badge: { paddingVertical: 6, paddingHorizontal: 10, borderRadius: 999, borderWidth: 1 },
-  badgeText: { color: "white", fontWeight: "900", fontSize: 12 },
-  badgeGood: { backgroundColor: "rgba(34,197,94,0.10)", borderColor: "rgba(34,197,94,0.22)" },
-  badgeWarn: { backgroundColor: "rgba(245,158,11,0.12)", borderColor: "rgba(245,158,11,0.24)" },
-  badgeBad: { backgroundColor: "rgba(239,68,68,0.12)", borderColor: "rgba(239,68,68,0.24)" },
+  sourceRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  sourceText: { color: "#93c5fd", textDecorationLine: "underline", flex: 1 },
 });

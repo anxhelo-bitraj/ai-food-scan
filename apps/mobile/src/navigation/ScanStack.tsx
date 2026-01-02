@@ -6,7 +6,7 @@ import ProductScreen from "../screens/ProductScreen";
 export type ProductTabKey = "Health" | "Additives" | "Allergens" | "Diet" | "Eco";
 
 export type ScanStackParamList = {
-  Scan: undefined;
+  ScanHome: undefined;
   Product: { barcode: string; initialTab?: ProductTabKey };
 };
 
@@ -22,8 +22,9 @@ export default function ScanStack() {
         headerShadowVisible: false,
       }}
     >
-      <Stack.Screen name="Scan" component={ScanScreen} options={{ title: "Scan" }} />
+      <Stack.Screen name="ScanHome" component={ScanScreen} options={{ title: "Scan" }} />
       <Stack.Screen name="Product" component={ProductScreen} options={{ title: "Product" }} />
     </Stack.Navigator>
   );
 }
+

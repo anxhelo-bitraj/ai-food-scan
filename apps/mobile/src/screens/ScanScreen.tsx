@@ -11,7 +11,7 @@ import ModeDock, { ModeItem, ScanModeKey } from "../components/ModeDock";
 import { ScanStackParamList, ProductTabKey } from "../navigation/ScanStack";
 import { addScanEvent } from "../store/scanHistoryStore";
 
-type Props = NativeStackScreenProps<ScanStackParamList, "Scan">;
+type Props = NativeStackScreenProps<ScanStackParamList, "ScanHome">;
 type ScanStatus = "idle" | "notFound";
 
 const MODES: ModeItem[] = [

@@ -8,3 +8,19 @@
 *.bak2
 
 cloud_pack/
+
+# local backups
+*.bak_*
+*.bak
+*.tmp
+
+# sqlite artifacts (generated)
+apps/api/data/risk.db
+apps/api/data/risk.db-*
+apps/api/data/*.db
+apps/api/data/*.db-*
+*.db-wal
+*.db-shm
+
+# local notes
+ai-food-scan_mobile_core.txt
