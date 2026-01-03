@@ -9,6 +9,8 @@ import { ScanStackParamList, ProductTabKey } from "../navigation/ScanStack";
 import Chip from "../components/Chip";
 import InfoSheet, { SheetSource } from "../components/InfoSheet";
 import { upsertRoutineItem } from "../store/routineStore";
+import { logAllergyCheckEvent, logScanEvent } from "../store/historyStore";
+import { getScanHistory } from "../store/scanHistoryStore";
 import { get, postJson } from "../lib/api";
 
 type Props = NativeStackScreenProps<ScanStackParamList, "Product">;
@@ -264,6 +266,7 @@ function NutriBar({ label, value, unit, bounds }: NutriBarProps) {
 
 export default function ProductScreen({ route }: Props) {
   const barcode = String((route as any)?.params?.barcode ?? "").trim();
+  const initialTabParam = (route as any)?.params?.initialTab as any;
 
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState<TabKey>("Health");
@@ -272,6 +275,23 @@ export default function ProductScreen({ route }: Props) {
   const [sheet, setSheet] = useState<{ title: string; body: string; sources?: SheetSource[] } | null>(null);
 
   const scoreAnim = useRef(new Animated.Value(0)).current;
+  const allergyLoggedRef = useRef<string | null>(null);
+
+  const inferredScanMode = useMemo(() => {
+    const pMode = String((route as any)?.params?.mode ?? "").toLowerCase();
+    if (pMode) return pMode;
+
+    const initialTab = String((route as any)?.params?.initialTab ?? "");
+    if (initialTab === "Allergens") return "allergy";
+
+    try {
+      const hit = getScanHistory().find((x) => String(x.barcode) === barcode);
+      return String(hit?.mode ?? "").toLowerCase();
+    } catch {
+      return "";
+    }
+  }, [barcode, route]);
+
 
   const additivesRisk = useMemo(() => computeAdditivesRisk(product.additives), [product.additives]);
   const allergensCount = useMemo(
@@ -324,6 +344,41 @@ export default function ProductScreen({ route }: Props) {
         }
 
         setProduct(merged);
+        try {
+          if (initialTabParam === "Allergens") {
+            const allergens = (merged.allergens ?? [])
+              .filter((x: any) => x?.status === "Listed")
+              .map((x: any) => String(x?.name ?? "").trim())
+              .filter(Boolean);
+
+            const traces = Array.isArray(merged.traces)
+              ? merged.traces.map((t: any) => String(t)).filter(Boolean)
+              : [];
+
+            logAllergyCheckEvent({
+              barcode: merged.barcode,
+              name: merged.name,
+              brand: merged.brand ?? null,
+              allergens,
+              traces,
+            });
+          }
+        } catch {}
+
+
+        // history (best effort)
+        try {
+          logScanEvent(
+            {
+              barcode: merged.barcode,
+              name: merged.name,
+              brand: merged.brand,
+              image_url: merged.image_url ?? null,
+              score: merged.healthScore,
+              additivesCount: merged.additives.length,
+            } as any
+          );
+        } catch {}
       } catch (e: any) {
         console.warn("Product fetch failed:", e?.message ?? e);
       } finally {
@@ -343,6 +398,27 @@ export default function ProductScreen({ route }: Props) {
   }, [barcode]);
 
   useEffect(() => {
+    if (loading) return;
+    if (inferredScanMode !== "allergy") return;
+    if (!product?.barcode) return;
+    if (allergyLoggedRef.current === product.barcode) return;
+    allergyLoggedRef.current = product.barcode;
+
+    const allergens = (product.allergens ?? [])
+      .filter((a) => a.status === "Listed")
+      .map((a) => a.name)
+      .filter(Boolean);
+
+    logAllergyCheckEvent({
+      allergens,
+      barcode: product.barcode,
+      name: product.name,
+      brand: product.brand,
+    });
+  }, [loading, inferredScanMode, product.barcode, product.name, product.brand, product.allergens]);
+
+
+  useEffect(() => {
     const to = loading ? 0 : product.healthScore / 100;
     Animated.timing(scoreAnim, { toValue: to, duration: 500, useNativeDriver: false }).start();
   }, [loading, product.healthScore, scoreAnim]);
@@ -354,7 +430,7 @@ export default function ProductScreen({ route }: Props) {
     Haptics.selectionAsync().catch(() => {});
   }
 
-  // ✅ FIX: save additives + e_numbers + counts into routine item
+  // ✅ save additives + e_numbers + counts into routine item
   function addToRoutine() {
     try {
       const additives_raw = uniq(
@@ -459,9 +535,7 @@ export default function ProductScreen({ route }: Props) {
               <Chip label={loading ? "Allergens …" : `Allergens: ${allergensCount}`} tone={allergensCount ? "warn" : "good"} />
               <Chip
                 label={loading ? "Additives …" : `Additives: ${product.additives.length}`}
-                tone={
-                  additivesRisk === "High" ? "bad" : additivesRisk === "Medium" ? "warn" : additivesRisk === "Low" ? "good" : "neutral"
-                }
+                tone={additivesRisk === "High" ? "bad" : additivesRisk === "Medium" ? "warn" : additivesRisk === "Low" ? "good" : "neutral"}
               />
             </View>
 
@@ -717,6 +791,7 @@ const styles = StyleSheet.create({
     gap: 8,
     alignItems: "center",
     justifyContent: "center",
+
     paddingVertical: 12,
     borderRadius: 16,
     backgroundColor: "rgba(255,255,255,0.10)",
@@ -812,3 +887,4 @@ const styles = StyleSheet.create({
 
   foot: { marginTop: 10, color: "rgba(255,255,255,0.45)", fontSize: 11, lineHeight: 15 },
 });
+

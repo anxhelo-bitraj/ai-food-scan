@@ -6,6 +6,7 @@ import { useFocusEffect } from "@react-navigation/native";
 import InfoSheet from "../components/InfoSheet";
 import { getRoutineItems } from "../store/routineStore";
 import { postJson } from "../lib/api";
+import { logRoutineCheckEvent } from "../store/historyStore";
 
 type SheetSource = { label: string; url?: string };
 type SheetState = { visible: boolean; title: string; body: string; sources?: SheetSource[] };
@@ -163,6 +164,17 @@ export default function InteractionCheckScreen() {
     setErr("");
     try {
       const r = await postJson<ApiResp>("/interactions/check", { e_numbers: eNumbers });
+      try {
+        const matches = Array.isArray((r as any)?.matches) ? (r as any).matches : [];
+        const scoreObj: any = (r as any)?.score ?? {};
+
+        logRoutineCheckEvent({
+          e_numbers: eNumbers,
+          matchesCount: matches.length,
+          score: typeof scoreObj?.score === "number" ? scoreObj.score : null,
+          grade: typeof scoreObj?.grade === "string" ? scoreObj.grade : null,
+        });
+      } catch {}
       setResp(r);
     } catch (e: any) {
       const msg = String(e?.message ?? e);

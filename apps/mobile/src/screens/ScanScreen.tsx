@@ -2,7 +2,7 @@ import React, { useCallback, useMemo, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { CameraView, useCameraPermissions } from "expo-camera";
-import { useFocusEffect, useIsFocused } from "@react-navigation/native";
+import {useFocusEffect, useIsFocused, useNavigation} from "@react-navigation/native";
 import { Ionicons } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
 import { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -23,7 +23,9 @@ const MODES: ModeItem[] = [
 ];
 
 export default function ScanScreen({ navigation }: Props) {
-  const insets = useSafeAreaInsets();
+  
+  const nav = useNavigation<any>();
+const insets = useSafeAreaInsets();
   const isFocused = useIsFocused();
   const [permission, requestPermission] = useCameraPermissions();
 
@@ -75,6 +77,15 @@ export default function ScanScreen({ navigation }: Props) {
   const openProduct = useCallback(
     (code: string, tab: ProductTabKey) => {
       addScanEvent({ barcode: code, mode, initialTab: tab });
+      try {
+        const modeKey =
+          tab === "Allergens" ? "allergy" :
+          tab === "Diet" ? "diet" :
+          tab === "Eco" ? "eco" :
+          "scanner";
+
+        addScanEvent({ barcode: code, mode: modeKey, initialTab: tab });
+      } catch {}
       navigation.navigate("Product", { barcode: code, initialTab: tab });
     },
     [mode, navigation]
@@ -124,6 +135,16 @@ export default function ScanScreen({ navigation }: Props) {
   if (!permission) {
     return (
       <SafeAreaView style={styles.center}>
+      {/* History quick access */}
+      <Pressable
+        onPress={() => nav.navigate("History")}
+        style={styles.historyFab}
+        hitSlop={12}
+      >
+        <Ionicons name="time-outline" size={18} color="rgba(255,255,255,0.92)" />
+        <Text style={styles.historyFabText}>History</Text>
+      </Pressable>
+
         <Text style={styles.text}>Requesting camera permission…</Text>
       </SafeAreaView>
     );
@@ -421,4 +442,22 @@ const styles = StyleSheet.create({
   text: { color: "white", textAlign: "center", marginBottom: 10 },
   link: { color: "#93c5fd", fontWeight: "800" },
   small: { marginTop: 10, color: "#9ca3af", fontSize: 12, lineHeight: 16 },
+
+  historyFab: {
+    position: "absolute",
+    top: 12,
+    right: 12,
+    zIndex: 50,
+    flexDirection: "row",
+    gap: 8,
+    alignItems: "center",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  historyFabText: { color: "rgba(255,255,255,0.92)", fontWeight: "900", fontSize: 12 },
+
 });

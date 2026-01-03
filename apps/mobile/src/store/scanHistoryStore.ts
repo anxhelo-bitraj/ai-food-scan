@@ -10,18 +10,19 @@ export type ScanEvent = {
   createdAtISO: string;
 };
 
-function getHistoryStore(): { history: ScanEvent[] } {
+type StoreShape = { history: ScanEvent[] };
+
+function getScanHistoryStore(): StoreShape {
   const g: any = globalThis as any;
-  if (!g.__aiFoodScanHistory) g.__aiFoodScanHistory = { history: [] };
-  return g.__aiFoodScanHistory as { history: ScanEvent[] };
+  if (!g.__aiFoodScanScanHistoryStore) g.__aiFoodScanScanHistoryStore = { history: [] } as StoreShape;
+  return g.__aiFoodScanScanHistoryStore as StoreShape;
 }
 
 export function addScanEvent(e: Omit<ScanEvent, "id" | "createdAtISO">) {
-  const store = getHistoryStore();
+  const store = getScanHistoryStore();
   const now = new Date();
   const createdAtISO = now.toISOString();
 
-  // Deduplicate: same barcode within 10 seconds → update timestamp instead of adding
   const recentIdx = store.history.findIndex(
     (x) => x.barcode === e.barcode && Math.abs(new Date(x.createdAtISO).getTime() - now.getTime()) < 10_000
   );
@@ -37,19 +38,18 @@ export function addScanEvent(e: Omit<ScanEvent, "id" | "createdAtISO">) {
     createdAtISO,
   });
 
-  // Keep last 300
   store.history = store.history.slice(0, 300);
 }
 
 export function getScanHistory(): ScanEvent[] {
-  return [...getHistoryStore().history];
+  return [...getScanHistoryStore().history];
 }
 
 export function clearScanHistory() {
-  getHistoryStore().history = [];
+  getScanHistoryStore().history = [];
 }
 
 export function removeScanEvent(id: string) {
-  const store = getHistoryStore();
+  const store = getScanHistoryStore();
   store.history = store.history.filter((x) => x.id !== id);
 }

@@ -24,3 +24,8 @@ apps/api/data/*.db-*
 
 # local notes
 ai-food-scan_mobile_core.txt
+# local backups
+apps/api/data/*.backup.csv
+apps/api/data/*.curated.backup.csv
+# local datasets (too big / not for git)
+datasets/
