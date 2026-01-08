@@ -29,3 +29,13 @@ apps/api/data/*.backup.csv
 apps/api/data/*.curated.backup.csv
 # local datasets (too big / not for git)
 datasets/
+
+# Python venvs / caches
+.venv/
+**/.venv/
+__pycache__/
+*.pyc
+
+# Node / Expo
+node_modules/
+.expo/

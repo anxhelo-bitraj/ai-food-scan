@@ -5,12 +5,16 @@ from app.db.session import engine
 from app.api.routes import products
 from app.api.routes.additives import router as additives_router
 from app.api.routes.interactions import router as interactions_router
+from app.api.routes.ai_recognize import router as ai_recognize_router
+from app.api.routes.ai import router as ai_router
 
 app = FastAPI(title="AI Food Scan API")
 
 app.include_router(products.router)
 app.include_router(additives_router)
 app.include_router(interactions_router)
+app.include_router(ai_recognize_router)
+app.include_router(ai_router)
 
 @app.get("/health")
 def health():

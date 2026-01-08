@@ -1,187 +1,271 @@
-from app.scoring_food import enrich_scores
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-from sqlalchemy import select
+import json
+import os
+import re
+import sqlite3
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from app.db.session import get_db
-from app.db.models import Product, ProductScore
-from app.services.openfoodfacts import fetch_off_product
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/products", tags=["products"])
 
-REFRESH_TTL = timedelta(days=7)
+OFF_BASE = os.environ.get("AI_FOODSCAN_OFF_BASE", "https://world.openfoodfacts.org").rstrip("/")
+OFF_TIMEOUT_SEC = float(os.environ.get("AI_FOODSCAN_OFF_TIMEOUT_SEC", "10"))
 
-def _now():
-    return datetime.now(timezone.utc)
+OFF_FIELDS = [
+    "code",
+    "product_name",
+    "product_name_en",
+    "brands",
+    "image_front_url",
+    "ingredients_text",
+    "ingredients_text_en",
+    "allergens_tags",
+    "traces_tags",
+    "additives_tags",
+    "additives_original_tags",
+    "nutriscore_grade",
+    "ecoscore_grade",
+    "ecoscore_score",
+]
 
-def _safe_list(v) -> List[Any]:
-    return v if isinstance(v, list) else []
+def _find_db_path() -> Optional[Path]:
+    here = Path(__file__).resolve()
+    candidates = [
+        here.parents[4] / "data" / "risk.db",  # .../apps/api/data/risk.db (most common)
+        here.parents[3] / "data" / "risk.db",  # fallback
+        here.parents[5] / "data" / "risk.db",  # fallback
+        Path.cwd() / "data" / "risk.db",       # if started from apps/api
+    ]
+    for c in candidates:
+        try:
+            if c.exists():
+                return c
+        except Exception:
+            pass
+    return None
 
-def _safe_dict(v) -> Dict[str, Any]:
-    return v if isinstance(v, dict) else {}
+DB_PATH = _find_db_path()
 
-def _as_aware_utc(dt):
-    if dt is None:
+def _conn() -> sqlite3.Connection:
+    if not DB_PATH or not DB_PATH.exists():
+        raise HTTPException(status_code=500, detail=f"Missing risk DB (risk.db). Looked for it near route file and CWD. DB_PATH={DB_PATH}")
+    c = sqlite3.connect(str(DB_PATH))
+    c.row_factory = sqlite3.Row
+    return c
+
+def _norm_e(x: str) -> str:
+    return str(x or "").strip().upper().replace(" ", "")
+
+def _base_e(x: str) -> str:
+    s = _norm_e(x)
+    m = re.match(r"^(E\d{3,4})", s)
+    return m.group(1) if m else s
+
+def _tag_tail(tag: str) -> str:
+    return str(tag or "").strip().lower().split(":")[-1]  # "en:e150d" -> "e150d"
+
+def _parse_additive_tag(tag: str) -> Optional[str]:
+    core = _tag_tail(tag)  # e150d
+    if not core.startswith("e"):
         return None
-    # If DB returns naive datetime, assume UTC
-    if getattr(dt, "tzinfo", None) is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
+    m = re.match(r"^e(\d{3,4})([a-z])?$", core)
+    if not m:
+        return None
+    digits = m.group(1)
+    suf = (m.group(2) or "").upper()
+    return f"E{digits}{suf}"
 
-def _needs_refresh(p: Product) -> bool:
-    synced = _as_aware_utc(getattr(p, "off_last_synced_at", None))
+def _parse_allergen_tag(tag: str) -> Optional[str]:
+    core = _tag_tail(tag)  # milk
+    core = core.strip()
+    return core or None
 
-    # Refresh if never synced
-    if synced is None:
-        return True
-
-    # Refresh if key fields still missing
-    if not getattr(p, "name", None) or not getattr(p, "image_url", None):
-        return True
-
-    if getattr(p, "ingredients_text", None) is None:
-        return True
-
-    # Refresh if TTL expired
+def _fetch_off(barcode: str) -> Dict[str, Any]:
+    url = f"{OFF_BASE}/api/v2/product/{barcode}.json?fields=" + ",".join(OFF_FIELDS)
     try:
-        if _now() - synced > REFRESH_TTL:
-            return True
-    except Exception:
-        return True
+        req = urllib.request.Request(url, headers={"User-Agent": "ai-food-scan/1.0"})
+        with urllib.request.urlopen(req, timeout=OFF_TIMEOUT_SEC) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"OpenFoodFacts fetch failed: {e}")
 
-    return False
+def _risk_bucket(risk_raw: str) -> str:
+    s = str(risk_raw or "").strip().lower()
+    if not s:
+        return "unknown"
+    if s in ("high",):
+        return "high"
+    if s in ("moderate", "medium", "low_to_moderate", "emerging_concern"):
+        return "medium"
+    if s in ("low",):
+        return "low"
+    return "unknown"
 
+def _score_from_counts(counts: Dict[str, int]) -> int:
+    # simple v1 score: 100 minus penalties
+    # tweak later; this is just to avoid "always A" when additives exist
+    high = int(counts.get("high", 0))
+    med = int(counts.get("medium", 0))
+    low = int(counts.get("low", 0))
+    unk = int(counts.get("unknown", 0))
+    score = 100 - (high * 25 + med * 10 + low * 3 + unk * 6)
+    if score < 0:
+        score = 0
+    if score > 100:
+        score = 100
+    return score
 
-async def _fetch_off_product_raw(barcode: str) -> dict:
-    import httpx
-    url = f"https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url)
-    except Exception:
-        return {}
-    if r.status_code != 200:
-        return {}
-    data = r.json() or {}
-    return data.get("product") or {}
+def _grade_from_score(score: Optional[int]) -> str:
+    if score is None:
+        return "A"
+    if score >= 80:
+        return "A"
+    if score >= 60:
+        return "B"
+    if score >= 40:
+        return "C"
+    if score >= 20:
+        return "D"
+    return "E"
 
-@router.get("/{barcode}")
-async def get_product(barcode: str, include_off: bool = False, db: Session = Depends(get_db)):
-    barcode = (barcode or "").strip()
+def _lookup_additive_info(c: sqlite3.Connection, e_number: str) -> Optional[Dict[str, Any]]:
+    e_norm = _norm_e(e_number)
+    e_base = _base_e(e_norm)
 
-    product = db.execute(select(Product).where(Product.barcode == barcode)).scalar_one_or_none()
-    if product is None:
-        product = Product(barcode=barcode)
-        db.add(product)
-        db.flush()
+    row = c.execute(
+        """
+        SELECT e_number, name, basic_risk_level, adi_mg_per_kg_bw_day, simple_user_message, source_url
+        FROM additives_info
+        WHERE UPPER(REPLACE(e_number,' ','')) IN (?,?)
+        LIMIT 1
+        """,
+        (e_norm, e_base),
+    ).fetchone()
 
-    # Refresh from OFF if needed (never crash)
-    if _needs_refresh(product):
-        try:
-            off = await fetch_off_product(barcode)
-        except Exception:
-            off = {}
+    if not row:
+        return None
 
-        if off:
-            product.name = off.get("name")
-            product.brand = off.get("brand")
-            product.image_url = off.get("image_url")
-
-            product.ingredients_text = off.get("ingredients_text")
-            product.allergens = off.get("allergens") or []
-            product.traces = off.get("traces") or []
-            product.additives = off.get("additives") or []
-            product.analysis = off.get("analysis") or []
-            product.diet_flags = off.get("diet_flags") or {"vegan": None, "vegetarian": None}
-
-            product.nutriscore_grade = off.get("nutriscore_grade")
-            product.ecoscore_grade = off.get("ecoscore_grade")
-            product.ecoscore_score = off.get("ecoscore_score")
-
-            product.off_last_synced_at = _now()
-
-        try:
-            db.commit()
-            db.refresh(product)
-        except Exception:
-            db.rollback()
-
-    score = db.execute(select(ProductScore).where(ProductScore.product_id == product.id)).scalar_one_or_none()
-
-    out = {
-        "barcode": product.barcode,
-        "name": product.name,
-        "brand": product.brand,
-        "image_url": product.image_url,
-        "ingredients_text": getattr(product, "ingredients_text", None),
-
-        # ALWAYS arrays (mobile safe)
-        "allergens": _safe_list(getattr(product, "allergens", None)),
-        "traces": _safe_list(getattr(product, "traces", None)),
-        "additives": _safe_list(getattr(product, "additives", None)),
-        "analysis": _safe_list(getattr(product, "analysis", None)),
-
-        "diet_flags": _safe_dict(getattr(product, "diet_flags", None)) or {"vegan": None, "vegetarian": None},
-
-        "nutriscore_grade": getattr(product, "nutriscore_grade", None),
-        "ecoscore_grade": getattr(product, "ecoscore_grade", None),
-        "ecoscore_score": getattr(product, "ecoscore_score", None),
-
-        "health_score": getattr(score, "health_score", None),
-        "eco_score": getattr(score, "eco_score", None),
-        "additive_score": getattr(score, "additive_score", None),
-    }
-
-
-    if include_off:
-        try:
-            raw = await _fetch_off_product_raw(barcode)
-            out["off"] = _off_summary(raw)
-        except Exception:
-            out["off"] = {}
-    return out
-@router.get("/{barcode}/off_raw")
-async def off_raw_product(barcode: str, product_only: bool = False):
-    """
-    Debug: return raw OpenFoodFacts payload for this barcode.
-    If product_only=true, return only the OFF 'product' object.
-    """
-    import httpx
-    from fastapi import HTTPException
-
-    url = f"https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url)
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"OFF request failed: {str(e)}")
-
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"OFF returned HTTP {r.status_code}")
-
-    data = r.json()
-    return (data.get("product") or {}) if product_only else data
-
-def _off_summary(p: dict) -> dict:
+    d = dict(row)
     return {
-        "nova_group": p.get("nova_group"),
-        "nutriscore_grade": p.get("nutriscore_grade"),
-        "nutriscore_data": p.get("nutriscore_data"),
-        "nutriments": p.get("nutriments"),
-        "nutrition_data_per": p.get("nutrition_data_per"),
-        "serving_size": p.get("serving_size"),
-        "ecoscore_grade": p.get("ecoscore_grade"),
-        "ecoscore_data": p.get("ecoscore_data"),
-        "packaging": p.get("packaging"),
-        "packaging_tags": p.get("packaging_tags") or [],
-        "packaging_materials_tags": p.get("packaging_materials_tags") or [],
-        "categories_tags": p.get("categories_tags") or [],
-        "labels_tags": p.get("labels_tags") or [],
-        "origins_tags": p.get("origins_tags") or [],
-        "countries_tags": p.get("countries_tags") or [],
-        "stores_tags": p.get("stores_tags") or [],
+        "e_number": d.get("e_number") or e_norm,
+        "name": d.get("name"),
+        "risk_level": d.get("basic_risk_level") or "unknown",
+        "adi": d.get("adi_mg_per_kg_bw_day"),
+        "description": d.get("simple_user_message"),
+        "source_url": d.get("source_url"),
     }
+
+class ProductResponse(BaseModel):
+    barcode: str
+    name: Optional[str] = None
+    brand: Optional[str] = None
+    image_url: Optional[str] = None
+    ingredients_text: Optional[str] = None
+    allergens: List[str] = []
+    traces: List[str] = []
+    additives: List[str] = []
+    analysis: List[Any] = []
+    diet_flags: Dict[str, Optional[bool]] = {"vegan": None, "vegetarian": None}
+    nutriscore_grade: Optional[str] = None
+    ecoscore_grade: Optional[str] = None
+    ecoscore_score: Optional[float] = None
+    health_score: Optional[float] = None
+    eco_score: Optional[float] = None
+    additive_score: Optional[float] = None
+    additives_info: List[Dict[str, Any]] = []
+    additive_grade: str = "A"
+    additives_score_breakdown: Dict[str, Any] = {"counts": {"high": 0, "medium": 0, "low": 0, "unknown": 0}, "method": "v1_penalty_100_minus_sum"}
+
+@router.get("/{barcode}", response_model=ProductResponse)
+def get_product(barcode: str) -> ProductResponse:
+    code = str(barcode or "").strip()
+    if not re.fullmatch(r"\d{8,14}", code):
+        raise HTTPException(status_code=400, detail="Invalid barcode (expected 8–14 digits).")
+
+    data = _fetch_off(code)
+    product = data.get("product") or None
+    if not product:
+        # OFF returns status fields, but keep this robust
+        raise HTTPException(status_code=404, detail=f"Product not found on OpenFoodFacts: {code}")
+
+    name = (product.get("product_name_en") or product.get("product_name") or "").strip() or None
+    brand = (product.get("brands") or "").strip() or None
+    image_url = (product.get("image_front_url") or "").strip() or None
+    ingredients = (product.get("ingredients_text_en") or product.get("ingredients_text") or "").strip() or None
+
+    allergens_tags = product.get("allergens_tags") or []
+    traces_tags = product.get("traces_tags") or []
+
+    allergens: List[str] = []
+    for t in allergens_tags if isinstance(allergens_tags, list) else []:
+        v = _parse_allergen_tag(str(t))
+        if v:
+            allergens.append(v)
+
+    traces: List[str] = []
+    for t in traces_tags if isinstance(traces_tags, list) else []:
+        v = _parse_allergen_tag(str(t))
+        if v:
+            traces.append(v)
+
+    # additives: prefer original tags if present
+    raw_add_tags = product.get("additives_original_tags") or product.get("additives_tags") or []
+    additives: List[str] = []
+    if isinstance(raw_add_tags, list):
+        for t in raw_add_tags:
+            e = _parse_additive_tag(str(t))
+            if e and e not in additives:
+                additives.append(e)
+
+    nutri = product.get("nutriscore_grade")
+    eco_grade = product.get("ecoscore_grade")
+    eco_score = product.get("ecoscore_score")
+
+    # enrich additive info + compute simple score breakdown
+    counts = {"high": 0, "medium": 0, "low": 0, "unknown": 0}
+    info: List[Dict[str, Any]] = []
+    try:
+        c = _conn()
+        for e in additives:
+            row = _lookup_additive_info(c, e)
+            if row:
+                info.append(row)
+                bucket = _risk_bucket(row.get("risk_level"))
+            else:
+                bucket = "unknown"
+                info.append({"e_number": e, "name": None, "risk_level": "unknown", "adi": None, "description": None, "source_url": None})
+            counts[bucket] += 1
+    except Exception:
+        # don’t break product fetch if DB isn’t available; just return product basics
+        pass
+
+    additive_score = _score_from_counts(counts) if additives else None
+    additive_grade = _grade_from_score(int(additive_score) if additive_score is not None else None)
+
+    return ProductResponse(
+        barcode=code,
+        name=name,
+        brand=brand,
+        image_url=image_url,
+        ingredients_text=ingredients,
+        allergens=allergens,
+        traces=traces,
+        additives=additives,
+        analysis=[],
+        diet_flags={"vegan": None, "vegetarian": None},
+        nutriscore_grade=str(nutri).strip() if nutri else None,
+        ecoscore_grade=str(eco_grade).strip() if eco_grade else None,
+        ecoscore_score=float(eco_score) if isinstance(eco_score, (int, float)) else None,
+        health_score=None,
+        eco_score=None,
+        additive_score=float(additive_score) if additive_score is not None else None,
+        additives_info=info,
+        additive_grade=additive_grade,
+        additives_score_breakdown={"counts": counts, "method": "v1_penalty_100_minus_sum"},
+    )

@@ -1,3 +1,5 @@
+// PATH: apps/mobile/src/lib/api.ts
+
 // src/lib/api.ts
 // NOTE: Do NOT default to localhost. On a real device that breaks and causes placeholder UI.
 const RAW = (process.env.EXPO_PUBLIC_API_URL ?? "").trim();
@@ -78,3 +80,62 @@ export async function postJson<T = any>(
     body: JSON.stringify(body ?? {}),
   });
 }
+
+// -----------------------------
+// AI Recognize (multipart upload)
+// POST /ai/recognize?k=5 (form field name: "image")
+// -----------------------------
+
+export type AiRecognizeMatch = {
+  code: string; // barcode
+  product_name?: string;
+  main_category?: string;
+  image_file?: string;
+  distance?: number;
+  i?: number;
+};
+
+export type AiRecognizeResponse = {
+  ok: boolean;
+  k: number;
+  results: AiRecognizeMatch[];
+};
+
+export async function aiRecognizeImage(uri: string, k = 5): Promise<AiRecognizeResponse> {
+  assertApiUrl();
+
+  // joinUrl expects a path like "/ai/recognize?..."
+  const url = joinUrl(API_URL, `/ai/recognize?k=${k}`);
+
+  const form = new FormData();
+  form.append(
+    "image",
+    {
+      uri,
+      name: "capture.jpg",
+      type: "image/jpeg",
+    } as any
+  );
+
+  const res = await fetch(url, {
+    method: "POST",
+    // IMPORTANT: do NOT set Content-Type for multipart in React Native
+    headers: { Accept: "application/json" },
+    body: form,
+  });
+
+  const text = await res.text();
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { ok: false, raw: text };
+  }
+
+  if (!res.ok) {
+    throw new Error(`aiRecognizeImage failed (${res.status}): ${text.slice(0, 300)}`);
+  }
+
+  return data as AiRecognizeResponse;
+}
+

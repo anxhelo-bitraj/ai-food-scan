@@ -1,5 +1,5 @@
 import React, { useCallback, useMemo, useRef, useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import {useFocusEffect, useIsFocused, useNavigation} from "@react-navigation/native";
@@ -11,6 +11,7 @@ import ModeDock, { ModeItem, ScanModeKey } from "../components/ModeDock";
 import { ScanStackParamList, ProductTabKey } from "../navigation/ScanStack";
 import { addScanEvent } from "../store/scanHistoryStore";
 
+import { aiRecognizeImage, AiRecognizeMatch } from "../lib/api";
 type Props = NativeStackScreenProps<ScanStackParamList, "ScanHome">;
 type ScanStatus = "idle" | "notFound";
 
@@ -42,6 +43,39 @@ const insets = useSafeAreaInsets();
   // Prevent repeated reads
   const lastScanRef = useRef<{ code: string; at: number }>({ code: "", at: 0 });
   const DEBOUNCE_MS = 1200;
+
+  // -----------------------------
+  // AI mode (capture -> backend /ai/recognize)
+  // -----------------------------
+  const cameraRef = useRef<any>(null);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiErr, setAiErr] = useState("");
+  const [aiResults, setAiResults] = useState<AiRecognizeMatch[]>([]);
+
+  const onAiCapture = useCallback(async () => {
+    if (mode !== "ai") return;
+    if (aiBusy) return;
+
+    setAiErr("");
+    setAiResults([]);
+    setAiBusy(true);
+
+    try {
+      if (soundOn) Haptics.selectionAsync().catch(() => {});
+      const photo = await cameraRef.current?.takePictureAsync?.({ quality: 0.6 });
+      const uri = photo?.uri;
+      if (!uri) throw new Error("Camera did not return a photo URI");
+
+      const resp = await aiRecognizeImage(uri, 5);
+      if (!resp?.ok) throw new Error("AI recognize failed");
+      setAiResults(Array.isArray(resp.results) ? resp.results : []);
+    } catch (e: any) {
+      setAiErr(String(e?.message ?? e));
+    } finally {
+      setAiBusy(false);
+    }
+  }, [aiBusy, mode, soundOn]);
+
 
   useFocusEffect(
     useCallback(() => {
@@ -170,6 +204,7 @@ const insets = useSafeAreaInsets();
         {/* Full-screen camera */}
         {isFocused ? (
           <CameraView
+            ref={cameraRef}
             style={StyleSheet.absoluteFill}
             facing="back"
             enableTorch={torchOn}
@@ -217,57 +252,93 @@ const insets = useSafeAreaInsets();
             <View style={[styles.corner, styles.br]} />
           </View>
         </View>
-
-        {/* AI Shelf mode overlay (prototype) */}
+        {/* AI mode (capture + results) */}
         {mode === "ai" ? (
           <View style={styles.aiOverlay} pointerEvents="box-none">
+            {/* Toggles (optional display controls) */}
             <View style={styles.aiPills}>
               <Pressable
                 style={[styles.aiPill, aiShowLabels ? styles.aiPillOn : styles.aiPillOff]}
                 onPress={() => setAiShowLabels((v) => !v)}
               >
-                <Text style={styles.aiPillText}>Labels</Text>
+                <Text style={styles.aiPillText}>Name</Text>
               </Pressable>
 
               <Pressable
                 style={[styles.aiPill, aiShowEco ? styles.aiPillOn : styles.aiPillOff]}
                 onPress={() => setAiShowEco((v) => !v)}
               >
-                <Text style={styles.aiPillText}>Eco</Text>
+                <Text style={styles.aiPillText}>Category</Text>
               </Pressable>
 
               <Pressable
                 style={[styles.aiPill, aiShowAllergens ? styles.aiPillOn : styles.aiPillOff]}
                 onPress={() => setAiShowAllergens((v) => !v)}
               >
-                <Text style={styles.aiPillText}>Allergens</Text>
+                <Text style={styles.aiPillText}>Code</Text>
               </Pressable>
             </View>
 
-            {shelfDetections.map((d) => (
+            {/* Results card */}
+            {aiErr ? (
+              <View style={[styles.aiResultsCard, { bottom: bottomPad + 170 }]} pointerEvents="auto">
+                <Text style={styles.aiResultsTitle}>AI error</Text>
+                <Text style={styles.aiErrText} numberOfLines={6}>
+                  {aiErr}
+                </Text>
+              </View>
+            ) : aiResults.length ? (
+              <View style={[styles.aiResultsCard, { bottom: bottomPad + 170 }]} pointerEvents="auto">
+                <Text style={styles.aiResultsTitle}>Top matches</Text>
+
+                {aiResults.slice(0, 5).map((m, idx) => (
+                  <Pressable
+                    key={`${m.code}-${idx}`}
+                    style={styles.aiResultRow}
+                    onPress={() => {
+                      if (soundOn) Haptics.selectionAsync().catch(() => {});
+                      openProduct(m.code, "Health");
+                    }}
+                  >
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.aiResultName} numberOfLines={1}>
+                        {aiShowLabels ? (m.product_name ? m.product_name : `Product ${m.code}`) : " "}
+                      </Text>
+
+                      <Text style={styles.aiResultMeta} numberOfLines={1}>
+                        {aiShowEco && m.main_category ? `Category: ${m.main_category}` : ""}
+                        {aiShowEco && aiShowAllergens ? "  •  " : ""}
+                        {aiShowAllergens ? `Code: ${m.code}` : ""}
+                      </Text>
+                    </View>
+
+                    <Ionicons name="chevron-forward" size={18} color="rgba(255,255,255,0.75)" />
+                  </Pressable>
+                ))}
+              </View>
+            ) : !aiBusy ? (
+              <View style={[styles.aiHintCard, { bottom: bottomPad + 170 }]} pointerEvents="none">
+                <Text style={styles.aiHintText}>Tap Capture to recognize a product</Text>
+              </View>
+            ) : null}
+
+            {/* Capture button */}
+            <View style={[styles.aiCaptureWrap, { bottom: bottomPad + 82 }]} pointerEvents="box-none">
               <Pressable
-                key={d.id}
-                style={[
-                  styles.aiBox,
-                  { left: d.left as any, top: d.top as any, width: d.w as any, height: d.h as any },
-                ]}
-                onPress={() => {
-                  if (soundOn) Haptics.selectionAsync().catch(() => {});
-                  openProduct(d.barcode, "Health");
-                }}
+                style={[styles.aiCaptureBtn, aiBusy ? styles.aiCaptureBtnDisabled : null]}
+                onPress={onAiCapture}
+                disabled={aiBusy}
               >
-                <Text style={styles.aiBoxTitle} numberOfLines={1}>
-                  {aiShowLabels ? `Product ${d.barcode.slice(-4)}` : " "}
-                </Text>
-                <Text style={styles.aiBoxSub} numberOfLines={1}>
-                  {aiShowEco ? "Eco: B (p)" : ""}{aiShowEco && aiShowAllergens ? " • " : ""}
-                  {aiShowAllergens ? "Allergens: 1 (p)" : ""}
-                </Text>
+                {aiBusy ? (
+                  <ActivityIndicator />
+                ) : (
+                  <Ionicons name="camera-outline" size={22} color="white" />
+                )}
               </Pressable>
-            ))}
+              <Text style={styles.aiCaptureHint}>{aiBusy ? "Recognizing…" : "Capture"}</Text>
+            </View>
           </View>
         ) : null}
-
         {/* Bottom floating dock */}
         <View style={[styles.bottomArea, { paddingBottom: bottomPad }]} pointerEvents="box-none">
           <View style={styles.hintPill} pointerEvents="none">
@@ -275,7 +346,7 @@ const insets = useSafeAreaInsets();
           </View>
 
           <View style={styles.dockWrap}>
-            <ModeDock modes={MODES} value={mode} onChange={setMode} />
+            <ModeDock modes={MODES} value={mode} onChange={(m) => { setMode(m as any); if ((m as any) !== "ai") { setAiErr(""); setAiResults([]); setAiBusy(false); } }} />
           </View>
         </View>
       </View>
@@ -459,5 +530,82 @@ const styles = StyleSheet.create({
     borderColor: "rgba(255,255,255,0.10)",
   },
   historyFabText: { color: "rgba(255,255,255,0.92)", fontWeight: "900", fontSize: 12 },
+
+
+  aiCaptureWrap: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    alignItems: "center",
+    gap: 8,
+    zIndex: 75,
+  },
+  aiCaptureBtn: {
+    width: 64,
+    height: 64,
+    borderRadius: 999,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(0,0,0,0.60)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+  },
+  aiCaptureBtnDisabled: { opacity: 0.65 },
+  aiCaptureHint: { color: "white", fontWeight: "900", fontSize: 12 },
+
+  aiResultsCard: {
+    position: "absolute",
+    left: 14,
+    right: 14,
+    padding: 12,
+    borderRadius: 18,
+    backgroundColor: "rgba(0,0,0,0.62)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+    zIndex: 74,
+    gap: 8,
+  },
+  aiResultsTitle: { color: "white", fontSize: 13, fontWeight: "900" },
+  aiErrText: {
+    color: "rgba(255,255,255,0.80)",
+    fontSize: 12,
+    fontWeight: "700",
+    lineHeight: 16,
+  },
+
+  aiResultRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 14,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  aiResultName: { color: "white", fontWeight: "900", fontSize: 12 },
+  aiResultMeta: {
+    color: "rgba(255,255,255,0.72)",
+    fontWeight: "800",
+    fontSize: 11,
+    marginTop: 2,
+  },
+
+  aiHintCard: {
+    position: "absolute",
+    left: 14,
+    right: 14,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.14)",
+    alignItems: "center",
+    zIndex: 74,
+  },
+  aiHintText: { color: "rgba(255,255,255,0.85)", fontWeight: "900", fontSize: 12 },
+
 
 });
