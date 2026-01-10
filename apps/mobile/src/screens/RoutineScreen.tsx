@@ -29,6 +29,10 @@ function safeNumber(x: any, fallback = 0) {
   return typeof x === "number" && Number.isFinite(x) ? x : fallback;
 }
 
+function getEnabled(it: any) {
+  return it?.enabled !== false; // default true
+}
+
 function getAdditivesCount(it: any) {
   // try common shapes
   if (typeof it?.badges?.additivesCount === "number") return it.badges.additivesCount;
@@ -137,7 +141,10 @@ export default function RoutineScreen({ navigation }: { navigation: any }) {
 
   const hasEnoughForCheck = useMemo(() => {
     let n = 0;
-    for (const it of items || []) n += getAdditivesCount(it);
+    for (const it of items || []) {
+      if (!getEnabled(it)) continue;
+      n += getAdditivesCount(it);
+    }
     return n >= 2;
   }, [items]);
 
@@ -151,11 +158,12 @@ export default function RoutineScreen({ navigation }: { navigation: any }) {
 
   const goCheck = useCallback(() => {
     if (!hasEnoughForCheck) {
-      Alert.alert("Add at least 2 additives", "Routine Check needs at least 2 additives in your routine (across one or more products) to compare combinations.");
+      Alert.alert(
+        "Add at least 2 additives",
+        "Routine Check needs at least 2 additives in your routine (across one or more products) to compare combinations.\n\nTip: excluded items (eye-off) don’t count."
+      );
       return;
     }
-    // Most builds have this screen registered somewhere (often in RoutineStack or ScanStack).
-    // Pass items as a fallback, but InteractionCheck can also read from store.
     try {
       navigation.navigate("InteractionCheck" as any, { items } as any);
     } catch {
@@ -168,7 +176,6 @@ export default function RoutineScreen({ navigation }: { navigation: any }) {
       if (!barcode) return;
       const payload = { screen: "Product", params: { barcode } };
 
-      // Prefer nested navigation: go to Scan tab then Product
       const parent = navigation.getParent?.();
       try {
         parent?.navigate?.("Scan" as any, payload as any);
@@ -180,25 +187,9 @@ export default function RoutineScreen({ navigation }: { navigation: any }) {
         return;
       } catch {}
 
-      // fallback: direct
       navigation.navigate("Product" as any, { barcode } as any);
     },
     [navigation]
-  );
-
-  const removeItem = useCallback(
-    (it: any) => {
-      const fn = (RoutineStore as any).removeRoutineItem ?? (RoutineStore as any).removeItem ?? null;
-      const id = it?.id ?? it?.barcode ?? null;
-      if (typeof fn === "function" && id) {
-        fn(id);
-        Haptics.selectionAsync().catch(() => null);
-        refresh();
-      } else {
-        Alert.alert("Remove failed", "Couldn’t remove this item (store function not found).");
-      }
-    },
-    [refresh]
   );
 
   const clearAll = useCallback(() => {
@@ -223,11 +214,11 @@ export default function RoutineScreen({ navigation }: { navigation: any }) {
     (it: any) => {
       const next = cycleFrequency(it?.frequency ?? it?.freq ?? it?.timesPerWeek ?? null);
 
-      // Try store setter first
       const fn =
         (RoutineStore as any).setRoutineItemFrequency ??
         (RoutineStore as any).setItemFrequency ??
         (RoutineStore as any).updateFrequency ??
+        (RoutineStore as any).setRoutineFrequency ??
         null;
 
       const id = it?.id ?? it?.barcode ?? null;
@@ -238,7 +229,6 @@ export default function RoutineScreen({ navigation }: { navigation: any }) {
         return;
       }
 
-      // Fallback: re-upsert item with frequency field
       const upsert = (RoutineStore as any).upsertRoutineItem ?? (RoutineStore as any).upsertItem ?? null;
       if (typeof upsert === "function") {
         upsert({ ...it, frequency: next });
@@ -248,6 +238,42 @@ export default function RoutineScreen({ navigation }: { navigation: any }) {
       }
 
       Alert.alert("Frequency", "Couldn’t save frequency (store function not found).");
+    },
+    [refresh]
+  );
+
+  const toggleEnabled = useCallback(
+    (it: any) => {
+      const id = it?.id ?? it?.barcode ?? null;
+      if (!id) return;
+
+      const cur = getEnabled(it);
+      const next = !cur;
+
+      const fn =
+        (RoutineStore as any).setRoutineItemEnabled ??
+        (RoutineStore as any).toggleRoutineItemEnabled ??
+        null;
+
+      if (typeof fn === "function") {
+        // setRoutineItemEnabled(id, enabled) OR toggleRoutineItemEnabled(id)
+        try {
+          if ((RoutineStore as any).setRoutineItemEnabled) (RoutineStore as any).setRoutineItemEnabled(id, next);
+          else (RoutineStore as any).toggleRoutineItemEnabled(id);
+        } catch {}
+        Haptics.selectionAsync().catch(() => null);
+        refresh();
+        return;
+      }
+
+      // fallback: re-upsert item with enabled field
+      const upsert = (RoutineStore as any).upsertRoutineItem ?? (RoutineStore as any).upsertItem ?? null;
+      if (typeof upsert === "function") {
+        upsert({ ...it, enabled: next });
+        Haptics.selectionAsync().catch(() => null);
+        refresh();
+        return;
+      }
     },
     [refresh]
   );
@@ -281,10 +307,7 @@ export default function RoutineScreen({ navigation }: { navigation: any }) {
             <Text style={styles.ctaText}>Scan to add</Text>
           </Pressable>
 
-          <Pressable
-            style={[styles.cta, !hasEnoughForCheck ? styles.ctaDisabled : styles.ctaDark]}
-            onPress={goCheck}
-          >
+          <Pressable style={[styles.cta, !hasEnoughForCheck ? styles.ctaDisabled : styles.ctaDark]} onPress={goCheck}>
             <Ionicons name="git-compare-outline" size={18} color="white" />
             <Text style={styles.ctaText}>Check</Text>
           </Pressable>
@@ -299,9 +322,10 @@ export default function RoutineScreen({ navigation }: { navigation: any }) {
           <Text style={styles.emptySub}>Tap “Scan to add” to build your routine.</Text>
         </View>
       ) : (
-        <View style={{ gap: 12 }}>
+        <View style={{ gap: 10 }}>
           {items.map((it, idx) => {
             const key = getStableKey(it, idx);
+            const enabled = getEnabled(it);
 
             const eco = getEcoGrade(it);
             const ecoTone = toneForEco(eco === "not-applicable" ? "" : eco);
@@ -312,8 +336,8 @@ export default function RoutineScreen({ navigation }: { navigation: any }) {
             const freqLabel = formatFrequency(it?.frequency ?? it?.freq ?? it?.timesPerWeek ?? "");
 
             return (
-              <View key={key} style={styles.itemCard}>
-                <Pressable style={{ flexDirection: "row", gap: 12, flex: 1 }} onPress={() => openProduct(it?.barcode)}>
+              <View key={key} style={[styles.rowCard, !enabled ? styles.rowCardOff : null]}>
+                <Pressable style={[styles.rowMain, !enabled ? { opacity: 0.55 } : null]} onPress={() => openProduct(it?.barcode)}>
                   <View style={styles.thumb}>
                     {it?.image_url ? <Image source={{ uri: it.image_url }} style={styles.thumbImg} /> : null}
                   </View>
@@ -331,27 +355,30 @@ export default function RoutineScreen({ navigation }: { navigation: any }) {
                       <Chip label={`Allergens ${allergens}`} tone={allergens > 0 ? "warn" : "good"} />
                       <Chip label={`Additives ${additives}`} tone={additives > 0 ? "bad" : "good"} />
                     </View>
-
-                    <View style={styles.freqRow}>
-                      <Text style={styles.freqLabel}>Frequency</Text>
-                      <Pressable style={styles.freqPill} onPress={() => setItemFrequency(it)}>
-                        <Text style={styles.freqText}>{freqLabel}</Text>
-                        <Ionicons name="chevron-forward" size={14} color="rgba(255,255,255,0.8)" />
-                      </Pressable>
-                    </View>
                   </View>
                 </Pressable>
 
-                <Pressable style={styles.trashBtn} onPress={() => removeItem(it)}>
-                  <Ionicons name="trash-outline" size={18} color="white" />
-                </Pressable>
+                <View style={styles.rowActions}>
+                  <Pressable style={styles.eyeBtn} onPress={() => toggleEnabled(it)}>
+                    <Ionicons name={enabled ? "eye-outline" : "eye-off-outline"} size={18} color="white" />
+                  </Pressable>
+
+                  <Pressable style={styles.freqPill} onPress={() => setItemFrequency(it)}>
+                    <Text style={styles.freqText}>{freqLabel}</Text>
+                    <Ionicons name="chevron-forward" size={14} color="rgba(255,255,255,0.8)" />
+                  </Pressable>
+                </View>
               </View>
             );
           })}
         </View>
       )}
 
-      <Pressable style={[styles.clearBtn, items.length === 0 ? { opacity: 0.5 } : null]} onPress={clearAll} disabled={items.length === 0}>
+      <Pressable
+        style={[styles.clearBtn, items.length === 0 ? { opacity: 0.5 } : null]}
+        onPress={clearAll}
+        disabled={items.length === 0}
+      >
         <Text style={styles.clearText}>Clear Routine</Text>
       </Pressable>
     </ScrollView>
@@ -416,21 +443,26 @@ const styles = StyleSheet.create({
   emptyTitle: { color: "white", fontWeight: "900", fontSize: 16 },
   emptySub: { marginTop: 6, color: "rgba(255,255,255,0.65)", lineHeight: 18 },
 
-  itemCard: {
-    marginTop: 10,
-    borderRadius: 22,
-    padding: 14,
+  // list row (not big cards)
+  rowCard: {
+    borderRadius: 18,
+    padding: 12,
     backgroundColor: "rgba(255,255,255,0.05)",
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.10)",
     flexDirection: "row",
-    gap: 10,
     alignItems: "center",
+    gap: 10,
   },
+  rowCardOff: {
+    backgroundColor: "rgba(255,255,255,0.035)",
+    borderColor: "rgba(255,255,255,0.075)",
+  },
+  rowMain: { flexDirection: "row", gap: 12, flex: 1, alignItems: "center" },
 
   thumb: {
-    width: 56,
-    height: 56,
+    width: 52,
+    height: 52,
     borderRadius: 16,
     backgroundColor: "rgba(255,255,255,0.06)",
     borderWidth: 1,
@@ -439,24 +471,24 @@ const styles = StyleSheet.create({
   },
   thumbImg: { width: "100%", height: "100%", resizeMode: "cover" },
 
-  itemTitle: { color: "white", fontSize: 18, fontWeight: "900" },
+  itemTitle: { color: "white", fontSize: 17, fontWeight: "900" },
   itemSub: { marginTop: 2, color: "rgba(255,255,255,0.55)", fontWeight: "800" },
 
-  badges: { marginTop: 10, flexDirection: "row", flexWrap: "wrap", gap: 10 },
+  badges: { marginTop: 8, flexDirection: "row", flexWrap: "wrap", gap: 10 },
 
-  trashBtn: {
-    width: 44,
-    height: 44,
+  rowActions: { alignItems: "flex-end", gap: 10 },
+
+  eyeBtn: {
+    width: 40,
+    height: 40,
     borderRadius: 999,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "rgba(255,80,80,0.14)",
+    backgroundColor: "rgba(255,255,255,0.06)",
     borderWidth: 1,
-    borderColor: "rgba(255,80,80,0.24)",
+    borderColor: "rgba(255,255,255,0.10)",
   },
 
-  freqRow: { marginTop: 12, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  freqLabel: { color: "rgba(255,255,255,0.45)", fontWeight: "900" },
   freqPill: {
     flexDirection: "row",
     alignItems: "center",
@@ -482,4 +514,3 @@ const styles = StyleSheet.create({
   },
   clearText: { color: "white", fontWeight: "900", fontSize: 16 },
 });
-

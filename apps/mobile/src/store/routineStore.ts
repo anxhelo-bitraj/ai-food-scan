@@ -9,9 +9,12 @@ export type RoutineItem = {
   image_url?: string | null;
   ingredients_text?: string | null;
 
+  // ✅ include/exclude from Routine Check (default true)
+  enabled: boolean;
+
   // ✅ critical for Interaction Check
   additives_raw?: string[]; // e.g. ["E322", "E322I"]
-  e_numbers?: string[];     // base only e.g. ["E322"]
+  e_numbers?: string[]; // base only e.g. ["E322"]
   allergens_raw?: string[]; // optional
 
   addedAtISO: string;
@@ -80,13 +83,15 @@ function safeStr(x: any, fallback = ""): string {
 }
 
 export function getRoutineItems(): RoutineItem[] {
-  return [...getStore().routine];
+  // ensure enabled defaults to true for older items already in memory
+  return getStore().routine.map((x) => ({ ...x, enabled: x?.enabled !== false }));
 }
 
 /**
  * Accepts partial input from screens (ProductScreen passes as any).
  * Ensures:
  * - id is set (defaults to barcode)
+ * - enabled defaults to true
  * - additives_raw + e_numbers are persisted
  * - badges.additivesCount + badges.allergensCount are computed
  * - upsert matches by barcode first (prevents duplicates)
@@ -99,7 +104,6 @@ export function upsertRoutineItem(input: any) {
 
   // find existing by barcode first (most stable), else by id
   const idx = store.routine.findIndex((x) => (barcode ? x.barcode === barcode : x.id === id));
-
   const prev = idx >= 0 ? store.routine[idx] : null;
 
   const additives_raw = Array.isArray(input?.additives_raw)
@@ -131,6 +135,9 @@ export function upsertRoutineItem(input: any) {
     additivesRisk: incomingBadges.additivesRisk ?? prevBadges.additivesRisk ?? "Low",
   };
 
+  const enabled =
+    typeof input?.enabled === "boolean" ? input.enabled : prev?.enabled !== false; // default true
+
   const next: RoutineItem = {
     id,
     barcode: barcode || (prev?.barcode ?? ""),
@@ -139,6 +146,8 @@ export function upsertRoutineItem(input: any) {
 
     image_url: input?.image_url ?? prev?.image_url ?? null,
     ingredients_text: input?.ingredients_text ?? prev?.ingredients_text ?? null,
+
+    enabled,
 
     additives_raw,
     e_numbers,
@@ -158,6 +167,21 @@ export function setRoutineFrequency(id: string, frequency: Frequency) {
   const store = getStore();
   const idx = store.routine.findIndex((x) => x.id === id || x.barcode === id);
   if (idx >= 0) store.routine[idx] = { ...store.routine[idx], frequency };
+}
+
+export function setRoutineItemEnabled(id: string, enabled: boolean) {
+  const store = getStore();
+  const idx = store.routine.findIndex((x) => x.id === id || x.barcode === id);
+  if (idx >= 0) store.routine[idx] = { ...store.routine[idx], enabled };
+}
+
+export function toggleRoutineItemEnabled(id: string) {
+  const store = getStore();
+  const idx = store.routine.findIndex((x) => x.id === id || x.barcode === id);
+  if (idx >= 0) {
+    const cur = store.routine[idx]?.enabled !== false;
+    store.routine[idx] = { ...store.routine[idx], enabled: !cur };
+  }
 }
 
 export function removeRoutineItem(id: string) {

@@ -1,8 +1,9 @@
-import React, { useMemo, useState } from "react";
+// PATH: apps/mobile/src/screens/HistoryScreen.tsx
+import React, { useCallback, useMemo, useState } from "react";
 import { Alert, Linking, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { useNavigation } from "@react-navigation/native";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
 
 import { clearHistoryEvents, getHistoryEvents, HistoryEvent, HistoryEventType } from "../store/historyStore";
 
@@ -150,9 +151,17 @@ export default function HistoryScreen() {
   const [filter, setFilter] = useState<FilterKey>("scan");
   const [events, setEvents] = useState<HistoryEvent[]>(() => getHistoryEvents());
 
-  function refresh() {
+  const refresh = useCallback(() => {
     setEvents(getHistoryEvents());
-  }
+  }, []);
+
+  // ✅ Auto-refresh when History screen is focused (fixes manual refresh problem)
+  useFocusEffect(
+    useCallback(() => {
+      refresh();
+      return () => {};
+    }, [refresh])
+  );
 
   const filtered = useMemo(() => {
     return events.filter((e) => e.type === filter).slice(0, 60);
@@ -177,7 +186,6 @@ export default function HistoryScreen() {
           {
             text: "Open Routine",
             onPress: () => {
-              // best effort: if your tab route is named "Routine", this jumps there
               try {
                 nav.navigate("Routine");
               } catch {}
@@ -403,3 +411,4 @@ const styles = StyleSheet.create({
   },
   clearBtnText: { color: "white", fontWeight: "900", fontSize: 16 },
 });
+

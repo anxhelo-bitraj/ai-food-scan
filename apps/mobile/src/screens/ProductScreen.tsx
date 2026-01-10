@@ -41,6 +41,9 @@ type UiProduct = {
   // v1: we show additives score here (0..100)
   healthScore: number;
 
+  // additive grade (backend)
+  additive_grade?: string | null;
+
   // OFF summary block
   off?: any | null;
 };
@@ -139,6 +142,7 @@ function buildPlaceholderProduct(barcode: string): UiProduct {
     ecoscore_score: null,
 
     healthScore: 60,
+    additive_grade: null,
     off: null,
   };
 }
@@ -171,6 +175,8 @@ function mergeApiIntoProduct(base: UiProduct, api: any): UiProduct {
   out.nutriscore_grade = typeof api?.nutriscore_grade === "string" ? api.nutriscore_grade : out.nutriscore_grade;
   out.ecoscore_grade = typeof api?.ecoscore_grade === "string" ? api.ecoscore_grade : out.ecoscore_grade;
   out.ecoscore_score = typeof api?.ecoscore_score === "number" ? api.ecoscore_score : out.ecoscore_score;
+
+  out.additive_grade = typeof api?.additive_grade === "string" ? api.additive_grade : out.additive_grade;
 
   out.off = api?.off ?? null;
 
@@ -230,12 +236,41 @@ function SkeletonLines() {
   );
 }
 
-type NutriBarProps = {
-  label: string;
-  value: number | null;
-  unit: string;
-  bounds: [number, number, number, number, number];
-};
+// -------- Ingredients bullets --------
+function splitIngredientsBullets(text: string): string[] {
+  const s = String(text || "").trim();
+  if (!s) return [];
+
+  const out: string[] = [];
+  let cur = "";
+  let depth = 0;
+
+  const push = () => {
+    const t = cur.trim().replace(/\s+/g, " ");
+    if (t) out.push(t);
+    cur = "";
+  };
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "(") depth++;
+    if (ch === ")") depth = Math.max(0, depth - 1);
+
+    if ((ch === "," || ch === ";") && depth === 0) {
+      push();
+    } else {
+      cur += ch;
+    }
+  }
+  push();
+
+  // If it didn’t really split, return the full line as 1 bullet
+  if (out.length <= 1) return [s];
+  return out;
+}
+
+// -------- Nutrition UI like Yuka --------
+type NutriBounds = [number, number, number, number, number];
 
 function clamp01(x: number) {
   if (x < 0) return 0;
@@ -243,23 +278,84 @@ function clamp01(x: number) {
   return x;
 }
 
-function NutriBar({ label, value, unit, bounds }: NutriBarProps) {
+function levelForValue(v: number, b: NutriBounds): 0 | 1 | 2 | 3 {
+  if (v <= b[1]) return 0; // green
+  if (v <= b[2]) return 1; // yellow
+  if (v <= b[3]) return 2; // orange
+  return 3; // red
+}
+
+function levelColor(lvl: 0 | 1 | 2 | 3) {
+  // close to the “Yuka” feel
+  if (lvl === 0) return "#22c55e";
+  if (lvl === 1) return "#facc15";
+  if (lvl === 2) return "#fb923c";
+  return "#ef4444";
+}
+
+function NutriRow({
+  icon,
+  label,
+  subtitle,
+  value,
+  unit,
+  bounds,
+}: {
+  icon: any;
+  label: string;
+  subtitle: string;
+  value: number | null;
+  unit: string;
+  bounds: NutriBounds;
+}) {
   const v = typeof value === "number" ? value : null;
   const max = bounds[4] > 0 ? bounds[4] : 1;
+
   const pct = v == null ? 0 : clamp01(v / max);
+  const lvl: 0 | 1 | 2 | 3 = v == null ? 1 : levelForValue(v, bounds);
+
+  const seg1 = Math.max(0.001, (bounds[1] - bounds[0]) / max);
+  const seg2 = Math.max(0.001, (bounds[2] - bounds[1]) / max);
+  const seg3 = Math.max(0.001, (bounds[3] - bounds[2]) / max);
+  const seg4 = Math.max(0.001, (bounds[4] - bounds[3]) / max);
 
   return (
-    <View style={{ gap: 6 }}>
-      <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
-        <Text style={styles.nLabel}>{label}</Text>
-        <Text style={styles.nValue}>{v == null ? "—" : `${v}${unit}`}</Text>
+    <View style={styles.nRow}>
+      <View style={styles.nLeft}>
+        <View style={styles.nIcon}>
+          <Ionicons name={icon} size={18} color="rgba(255,255,255,0.88)" />
+        </View>
+
+        <View style={{ flex: 1 }}>
+          <Text style={styles.nTitle}>{label}</Text>
+          <Text style={styles.nSub}>{subtitle}</Text>
+        </View>
       </View>
-      <View style={styles.nTrack}>
-        <View style={[styles.nFill, { width: `${Math.round(pct * 100)}%` }]} />
+
+      <View style={styles.nRight}>
+        <Text style={styles.nVal}>{v == null ? "—" : `${v}${unit}`}</Text>
+        <View style={[styles.nDot, { backgroundColor: levelColor(lvl) }]} />
       </View>
-      <Text style={styles.nHint}>
-        Thresholds: {bounds[1]} / {bounds[2]} / {bounds[3]} / {bounds[4]} {unit.trim()}
-      </Text>
+
+      <View style={styles.nBarWrap}>
+        <View style={styles.nBar}>
+          <View style={[styles.nSeg, { flex: seg1, backgroundColor: "#22c55e" }]} />
+          <View style={[styles.nSeg, { flex: seg2, backgroundColor: "#86efac" }]} />
+          <View style={[styles.nSeg, { flex: seg3, backgroundColor: "#fb923c" }]} />
+          <View style={[styles.nSeg, { flex: seg4, backgroundColor: "#ef4444" }]} />
+          <View style={[styles.nMarkerWrap, { left: `${Math.round(pct * 100)}%` }]}>
+            <View style={styles.nMarker} />
+          </View>
+        </View>
+
+        <View style={styles.nTicks}>
+          <Text style={styles.nTick}>0</Text>
+          <Text style={styles.nTick}>{String(bounds[1])}</Text>
+          <Text style={styles.nTick}>{String(bounds[2])}</Text>
+          <Text style={styles.nTick}>{String(bounds[3])}</Text>
+          <Text style={styles.nTick}>{String(bounds[4])}</Text>
+        </View>
+      </View>
     </View>
   );
 }
@@ -291,7 +387,6 @@ export default function ProductScreen({ route }: Props) {
       return "";
     }
   }, [barcode, route]);
-
 
   const additivesRisk = useMemo(() => computeAdditivesRisk(product.additives), [product.additives]);
   const allergensCount = useMemo(
@@ -344,6 +439,7 @@ export default function ProductScreen({ route }: Props) {
         }
 
         setProduct(merged);
+
         try {
           if (initialTabParam === "Allergens") {
             const allergens = (merged.allergens ?? [])
@@ -364,7 +460,6 @@ export default function ProductScreen({ route }: Props) {
             });
           }
         } catch {}
-
 
         // history (best effort)
         try {
@@ -416,7 +511,6 @@ export default function ProductScreen({ route }: Props) {
       brand: product.brand,
     });
   }, [loading, inferredScanMode, product.barcode, product.name, product.brand, product.allergens]);
-
 
   useEffect(() => {
     const to = loading ? 0 : product.healthScore / 100;
@@ -477,11 +571,10 @@ export default function ProductScreen({ route }: Props) {
   const off = (product as any)?.off ?? null;
   const nutr = off?.nutriments ?? {};
   const perRaw = String(off?.nutrition_data_per ?? "100g").trim();
-  const per = perRaw === "100g" ? "per 100 g/ml" : `per ${perRaw}`;
+  const perShort = /ml/i.test(perRaw) ? "per 100 mL" : "per 100 g";
 
   const nutriGrade = String((off?.nutriscore_grade ?? product.nutriscore_grade ?? "—")).toUpperCase();
-  const nova = off?.nova_group ?? "—";
-  const serving = off?.serving_size ?? "—";
+  const additiveGrade = String(product.additive_grade ?? "—").toUpperCase();
 
   const kcal100 = nutr["energy-kcal_100g"] ?? nutr["energy-kcal"] ?? null;
   const sugar100 = nutr["sugars_100g"] ?? null;
@@ -490,6 +583,42 @@ export default function ProductScreen({ route }: Props) {
 
   const ecoGrade = String(product.ecoscore_grade ?? "—");
   const offUrl = `https://world.openfoodfacts.org/product/${encodeURIComponent(product.barcode)}`;
+
+  const ingredientsText = String(product.ingredients_text ?? off?.ingredients_text ?? "").trim();
+  const ingredientsBullets = useMemo(() => splitIngredientsBullets(ingredientsText), [ingredientsText]);
+
+  // Thresholds used earlier (kept consistent)
+  const B_ENERGY: NutriBounds = [0, 1, 14, 35, 65];
+  const B_SUGAR: NutriBounds = [0, 1.5, 3, 7, 13];
+  const B_SAT: NutriBounds = [0, 1, 3, 6, 10];
+  const B_SALT: NutriBounds = [0, 0.23, 0.7, 1.4, 2.3];
+
+  const energySubtitle = (() => {
+    if (typeof kcal100 !== "number") return "—";
+    const lvl = levelForValue(kcal100, B_ENERGY);
+    return lvl >= 3 ? "Too caloric" : lvl === 2 ? "High energy" : lvl === 1 ? "Moderate energy" : "Low energy";
+  })();
+
+  const sugarSubtitle = (() => {
+    if (typeof sugar100 !== "number") return "—";
+    const lvl = levelForValue(sugar100, B_SUGAR);
+    return lvl >= 3 ? "Too sweet" : lvl === 2 ? "High sugar" : lvl === 1 ? "Moderate sugar" : "Low sugar";
+  })();
+
+  const satSubtitle = (() => {
+    if (typeof sat100 !== "number") return "—";
+    const lvl = levelForValue(sat100, B_SAT);
+    return lvl === 0 ? "No saturated fat" : lvl === 1 ? "Low saturates" : lvl === 2 ? "Some saturates" : "High saturates";
+  })();
+
+  const saltSubtitle = (() => {
+    if (typeof salt100 !== "number") return "—";
+    const lvl = levelForValue(salt100, B_SALT);
+    return lvl === 0 ? "No salt" : lvl === 1 ? "Low salt" : lvl === 2 ? "Some salt" : "High salt";
+  })();
+
+  const hasNutrition =
+    typeof kcal100 === "number" || typeof sugar100 === "number" || typeof sat100 === "number" || typeof salt100 === "number";
 
   return (
     <SafeAreaView style={styles.screen} edges={["top"]}>
@@ -535,7 +664,15 @@ export default function ProductScreen({ route }: Props) {
               <Chip label={loading ? "Allergens …" : `Allergens: ${allergensCount}`} tone={allergensCount ? "warn" : "good"} />
               <Chip
                 label={loading ? "Additives …" : `Additives: ${product.additives.length}`}
-                tone={additivesRisk === "High" ? "bad" : additivesRisk === "Medium" ? "warn" : additivesRisk === "Low" ? "good" : "neutral"}
+                tone={
+                  additivesRisk === "High"
+                    ? "bad"
+                    : additivesRisk === "Medium"
+                    ? "warn"
+                    : additivesRisk === "Low"
+                    ? "good"
+                    : "neutral"
+                }
               />
             </View>
 
@@ -577,26 +714,87 @@ export default function ProductScreen({ route }: Props) {
                 <Row label="Additives score" value={loading ? "…" : `${product.healthScore}/100`} />
                 <Row label="Additives risk" value={loading ? "…" : additivesRisk} />
                 <Row label="Allergens listed" value={loading ? "…" : `${allergensCount}`} />
-
-                <View style={{ marginTop: 12 }}>
-                  <Row label="Nutri-Score" value={loading ? "…" : nutriGrade} />
-                  <Row label="NOVA" value={loading ? "…" : String(nova)} />
-                  <Row label="Serving size" value={loading ? "…" : String(serving)} />
-                  <Row label="Calories (per 100g/ml)" value={loading ? "…" : kcal100 == null ? "—" : `${kcal100} kcal`} />
-                  <Row label="Sugar (per 100g/ml)" value={loading ? "…" : sugar100 == null ? "—" : `${sugar100} g`} />
-                  <Row label="Salt (per 100g/ml)" value={loading ? "…" : salt100 == null ? "—" : `${salt100} g`} />
-                </View>
+                <Row label="Nutri-Score" value={loading ? "…" : nutriGrade} />
+                <Row label="Additives grade" value={loading ? "…" : additiveGrade} />
               </Card>
 
-              <Card title={`Nutrition bars (${per})`}>
+              <Card title="Ingredients">
                 {loading ? <SkeletonLines /> : null}
                 {!loading ? (
-                  <View style={{ marginTop: 10, gap: 14 }}>
-                    <NutriBar label="Energy" value={typeof kcal100 === "number" ? kcal100 : null} unit=" kcal" bounds={[0, 1, 14, 35, 65]} />
-                    <NutriBar label="Sugar" value={typeof sugar100 === "number" ? sugar100 : null} unit=" g" bounds={[0, 1.5, 3, 7, 13]} />
-                    <NutriBar label="Saturates" value={typeof sat100 === "number" ? sat100 : null} unit=" g" bounds={[0, 1, 3, 6, 10]} />
-                    <NutriBar label="Salt" value={typeof salt100 === "number" ? salt100 : null} unit=" g" bounds={[0, 0.23, 0.7, 1.4, 2.3]} />
-                  </View>
+                  ingredientsBullets.length ? (
+                    <View style={{ gap: 10 }}>
+                      {ingredientsBullets.map((it, idx) => (
+                        <View key={`${idx}-${it.slice(0, 10)}`} style={styles.bulletRow}>
+                          <Text style={styles.bulletDot}>•</Text>
+                          <Text style={styles.bulletText}>{it}</Text>
+                        </View>
+                      ))}
+                    </View>
+                  ) : (
+                    <Text style={styles.p}>No ingredients text available.</Text>
+                  )
+                ) : null}
+              </Card>
+
+              <Card title="Nutrition">
+                {loading ? <SkeletonLines /> : null}
+
+                {!loading ? (
+                  !hasNutrition ? (
+                    <Text style={styles.p}>No OFF nutrition breakdown available yet.</Text>
+                  ) : (
+                    <View style={{ gap: 16 }}>
+                      <View style={styles.nSectionHeader}>
+                        <Text style={styles.nSectionTitle}>Negatives</Text>
+                        <Text style={styles.nSectionPer}>{perShort}</Text>
+                      </View>
+
+                      <View style={styles.nGroup}>
+                        <NutriRow
+                          icon="flame-outline"
+                          label="Energy"
+                          subtitle={energySubtitle}
+                          value={typeof kcal100 === "number" ? kcal100 : null}
+                          unit=" kcal"
+                          bounds={B_ENERGY}
+                        />
+                        <View style={styles.nDivider} />
+                        <NutriRow
+                          icon="cube-outline"
+                          label="Sugar"
+                          subtitle={sugarSubtitle}
+                          value={typeof sugar100 === "number" ? sugar100 : null}
+                          unit=" g"
+                          bounds={B_SUGAR}
+                        />
+                      </View>
+
+                      <View style={[styles.nSectionHeader, { marginTop: 4 }]}>
+                        <Text style={styles.nSectionTitle}>Positives</Text>
+                        <Text style={styles.nSectionPer}>{perShort}</Text>
+                      </View>
+
+                      <View style={styles.nGroup}>
+                        <NutriRow
+                          icon="water-outline"
+                          label="Saturates"
+                          subtitle={satSubtitle}
+                          value={typeof sat100 === "number" ? sat100 : null}
+                          unit=" g"
+                          bounds={B_SAT}
+                        />
+                        <View style={styles.nDivider} />
+                        <NutriRow
+                          icon="restaurant-outline"
+                          label="Salt"
+                          subtitle={saltSubtitle}
+                          value={typeof salt100 === "number" ? salt100 : null}
+                          unit=" g"
+                          bounds={B_SALT}
+                        />
+                      </View>
+                    </View>
+                  )
                 ) : null}
               </Card>
             </>
@@ -879,12 +1077,69 @@ const styles = StyleSheet.create({
 
   skel: { height: 12, borderRadius: 8, width: "88%", backgroundColor: "rgba(255,255,255,0.08)" },
 
-  nLabel: { color: "rgba(255,255,255,0.85)", fontWeight: "900", fontSize: 12 },
-  nValue: { color: "rgba(255,255,255,0.85)", fontWeight: "900", fontSize: 12 },
-  nTrack: { height: 10, borderRadius: 999, backgroundColor: "rgba(255,255,255,0.08)", overflow: "hidden" },
-  nFill: { height: "100%", backgroundColor: "rgba(255,255,255,0.45)" },
-  nHint: { color: "rgba(255,255,255,0.45)", fontSize: 11, fontWeight: "800" },
-
   foot: { marginTop: 10, color: "rgba(255,255,255,0.45)", fontSize: 11, lineHeight: 15 },
+
+  // Ingredients bullets
+  bulletRow: { flexDirection: "row", gap: 10, alignItems: "flex-start" },
+  bulletDot: { color: "rgba(255,255,255,0.85)", fontWeight: "900", fontSize: 16, lineHeight: 18, marginTop: 0 },
+  bulletText: { flex: 1, color: "rgba(255,255,255,0.82)", fontSize: 13, lineHeight: 18, fontWeight: "700" },
+
+  // Nutrition (Yuka-like)
+  nSectionHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "baseline" },
+  nSectionTitle: { color: "white", fontWeight: "900", fontSize: 18 },
+  nSectionPer: { color: "rgba(255,255,255,0.55)", fontWeight: "800", fontSize: 12 },
+
+  nGroup: {
+    borderRadius: 18,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+    backgroundColor: "rgba(0,0,0,0.35)",
+  },
+  nDivider: { height: 1, backgroundColor: "rgba(255,255,255,0.10)" },
+
+  nRow: { paddingHorizontal: 12, paddingVertical: 12, gap: 10 },
+  nLeft: { flexDirection: "row", gap: 10, alignItems: "center" },
+  nIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+  },
+  nTitle: { color: "white", fontWeight: "900", fontSize: 14 },
+  nSub: { color: "rgba(255,255,255,0.60)", fontWeight: "800", fontSize: 12, marginTop: 2 },
+
+  nRight: { position: "absolute", right: 12, top: 12, flexDirection: "row", alignItems: "center", gap: 10 },
+  nVal: { color: "rgba(255,255,255,0.92)", fontWeight: "900", fontSize: 14 },
+  nDot: { width: 12, height: 12, borderRadius: 999 },
+
+  nBarWrap: { marginTop: 2 },
+  nBar: {
+    height: 8,
+    borderRadius: 999,
+    overflow: "hidden",
+    flexDirection: "row",
+    backgroundColor: "rgba(255,255,255,0.06)",
+  },
+  nSeg: { height: "100%" },
+
+  nMarkerWrap: { position: "absolute", top: -6, transform: [{ translateX: -6 }] },
+  nMarker: {
+    width: 0,
+    height: 0,
+    borderLeftWidth: 6,
+    borderRightWidth: 6,
+    borderTopWidth: 8,
+    borderLeftColor: "transparent",
+    borderRightColor: "transparent",
+    borderTopColor: "rgba(255,255,255,0.90)",
+  },
+
+  nTicks: { flexDirection: "row", justifyContent: "space-between", marginTop: 6 },
+  nTick: { color: "rgba(255,255,255,0.50)", fontWeight: "800", fontSize: 11 },
 });
 

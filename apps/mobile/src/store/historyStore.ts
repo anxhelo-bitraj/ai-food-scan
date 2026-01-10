@@ -11,6 +11,23 @@ export type HistoryEvent = {
 
 type StoreShape = { events: HistoryEvent[] };
 
+// ✅ NEW: simple subscription so HistoryScreen can live-update without manual refresh
+type Listener = () => void;
+const _listeners = new Set<Listener>();
+
+function notify() {
+  for (const fn of _listeners) {
+    try {
+      fn();
+    } catch {}
+  }
+}
+
+export function subscribeHistory(listener: Listener) {
+  _listeners.add(listener);
+  return () => _listeners.delete(listener);
+}
+
 function getStore(): StoreShape {
   const g: any = globalThis as any;
   // Use a dedicated key to avoid collisions with other “history” stores
@@ -31,6 +48,7 @@ export function getHistoryEvents(): HistoryEvent[] {
 
 export function clearHistoryEvents() {
   getStore().events = [];
+  notify(); // ✅ NEW
 }
 
 export function logHistoryEvent(input: Omit<HistoryEvent, "id" | "createdAt"> & { createdAt?: number }) {
@@ -47,6 +65,8 @@ export function logHistoryEvent(input: Omit<HistoryEvent, "id" | "createdAt"> & 
 
   s.events.unshift(ev);
   if (s.events.length > MAX_EVENTS) s.events = s.events.slice(0, MAX_EVENTS);
+
+  notify(); // ✅ NEW
   return ev;
 }
 
@@ -127,3 +147,4 @@ export function logAllergyCheckEvent(input: {
     },
   });
 }
+
